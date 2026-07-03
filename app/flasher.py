@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import threading
+import time
 
 from app.config import FIRMWARE_DIR
 from app.utils import log
@@ -86,6 +87,7 @@ class Flasher:
         self._broadcast()
         old_stdout, old_stderr = sys.stdout, sys.stderr
         captured = io.StringIO()
+        flashed = False
         try:
             import esptool
             sys.stdout = captured
@@ -94,24 +96,17 @@ class Flasher:
                 "--port", port, "--baud", "921600", "--chip", "esp32s3",
                 "write_flash", "0x0", image,
             ])
-            self.status = "done"
-            self.progress = 100
+            flashed = True
         except SystemExit as e:
-            if e.code == 0:
-                self.status = "done"
-                self.progress = 100
-            else:
-                self.status = "error"
+            flashed = (e.code == 0)
+            if not flashed:
                 self.error = captured.getvalue()[-300:]
         except Exception as e:
-            self.status = "error"
             self.error = str(e)
         finally:
             sys.stdout = old_stdout
             sys.stderr = old_stderr
-            self.running = False
-            self._broadcast()
-            log(f"[Flash] {self.status}: {self.error or 'OK'}")
+        self._finish_flash(port, flashed)
 
     def _verify_sha256(self, manifest_path: str, firmware_dir: str) -> bool:
         """Verify firmware files against SHA256 hashes in manifest."""
@@ -140,6 +135,46 @@ class Flasher:
         log("[Flash] SHA256 verification passed")
         return True
 
+    def _verify_node_boot(self, port: str, attempts: int = 5) -> bool:
+        """Post-flash boot self-check: confirm the node actually BOOTS THE APP, not just
+        that esptool wrote bytes. A wrong-offset / corrupt / partition-mismatch flash leaves
+        the chip boot-looping in the bootloader — esptool still exits 0, so without this a bad
+        flash 'succeeds' and only surfaces steps later (e.g. Format SD 'no Format-OK ack'). A
+        booted app answers 'i' with FW/MAC; a boot-loop answers nothing."""
+        from app import node_serial
+        for _ in range(max(1, attempts)):
+            time.sleep(2.0)
+            try:
+                ident = node_serial.read_identity(port)
+            except Exception:
+                ident = {}
+            if ident.get("fw") or ident.get("mac"):
+                return True
+        return False
+
+    def _finish_flash(self, port: str, flashed: bool):
+        """Shared flash tail: gate 'done' on the post-flash boot self-check so a bad image
+        fails HERE (loudly, at the Flash step) instead of silently downstream."""
+        if flashed:
+            self.status = "verifying"
+            self.progress = 95
+            self._broadcast()
+            if self._verify_node_boot(port):
+                self.status = "done"
+                self.progress = 100
+            else:
+                self.status = "error"
+                self.error = ("flash wrote OK but the node did NOT boot the app after reset "
+                              "(bad image / wrong offset / partition-scheme mismatch) — "
+                              "post-flash self-check failed")
+        else:
+            self.status = "error"
+            if not self.error:
+                self.error = "flash failed"
+        self.running = False
+        self._broadcast()
+        log(f"[Flash] {self.status}: {self.error or 'OK'}")
+
     def _run(self, port: str, bootloader: str, partitions: str, firmware: str):
         self.running = True
         self.progress = 0
@@ -151,6 +186,7 @@ class Flasher:
         old_stderr = sys.stderr
         captured = io.StringIO()
 
+        flashed = False
         try:
             import esptool
             sys.stdout = captured
@@ -165,24 +201,17 @@ class Flasher:
                 "0x8000", partitions,
                 "0x10000", firmware,
             ])
-            self.status = "done"
-            self.progress = 100
+            flashed = True
         except SystemExit as e:
-            if e.code == 0:
-                self.status = "done"
-                self.progress = 100
-            else:
-                self.status = "error"
+            flashed = (e.code == 0)
+            if not flashed:
                 self.error = captured.getvalue()[-300:]
         except Exception as e:
-            self.status = "error"
             self.error = str(e)
         finally:
             sys.stdout = old_stdout
             sys.stderr = old_stderr
-            self.running = False
-            self._broadcast()
-            log(f"[Flash] {self.status}: {self.error or 'OK'}")
+        self._finish_flash(port, flashed)
 
     def _broadcast(self):
         if self.ws:
