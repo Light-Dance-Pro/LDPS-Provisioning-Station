@@ -1,5 +1,6 @@
 """Firmware flash routes."""
 import asyncio
+import os
 
 from fastapi import APIRouter, Request, Body
 from fastapi.responses import JSONResponse
@@ -36,17 +37,31 @@ async def flash_start(request: Request, data: dict = Body(...)):
         return JSONResponse({"error": "Flash already in progress"}, 409)
 
     # #4: the Station is the cloud-facing gateway — version-check the registry and download
-    # the merged factory image ONLY if a newer version exists (the line isn't interrupted by
-    # a download every unit), then flash it at 0x0. The node itself stays offline.
+    # the per-version APP image ONLY if a newer version exists (the line isn't interrupted by
+    # a download every unit). The node itself stays offline.
     cloud_url = getattr(s, "cloud_url", "") or ""
     if not cloud_url:
         return JSONResponse({"error": "No Cloud target — log in first"}, 401)
-    from app.firmware_cache import get_latest
+    from app.firmware_cache import get_latest, _slug
     fw = await get_latest(cloud_url, product, channel)
     if not fw.get("ok"):
         return JSONResponse({"error": f"firmware: {fw.get('error')}"}, 502)
 
-    if not s.flasher.start_image(port, fw["path"]):
+    # Factory flash writes a BLANK chip, so it needs the FULL image: bootloader@0x0 +
+    # partitions@0x8000 + app@0x10000. The registry firmware.bin is the OTA APP image
+    # (app-only; OTA writes it to an app partition on an already-booting node) — flashing
+    # it ALONE at 0x0 clobbers the bootloader → boot-loop. Pair the per-version app with
+    # the Station's bundled stable bootloader + partition table (flash_boot/<product>/,
+    # versioned with the node's partition scheme, not the app). See flash_boot/README.md.
+    boot_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+                            "flash_boot", _slug(product))
+    bootloader = os.path.join(boot_dir, "bootloader.bin")
+    partitions = os.path.join(boot_dir, "partitions.bin")
+    if not (os.path.exists(bootloader) and os.path.exists(partitions)):
+        return JSONResponse({"error": f"No bundled boot assets for '{product}' "
+                                      f"(expected flash_boot/{_slug(product)}/bootloader.bin+partitions.bin) "
+                                      f"— cannot factory-flash a blank chip"}, 500)
+    if not s.flasher.start_three(port, bootloader, partitions, fw["path"]):
         return JSONResponse({"error": s.flasher.error or "Failed to start flash"}, 500)
 
     log(f"[Route] Flash {product} v{fw['version']} (downloaded={fw['changed']}) on {port}")

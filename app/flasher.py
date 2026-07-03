@@ -46,9 +46,29 @@ class Flasher:
         self._thread.start()
         return True
 
+    def start_three(self, port: str, bootloader: str, partitions: str, firmware: str) -> bool:
+        """Factory (USB) flash for a BLANK chip: bootloader@0x0 + partitions@0x8000 +
+        app@0x10000. A blank ESP32-S3 has no bootloader / partition-table, so the
+        registry's app-only OTA image flashed ALONE at 0x0 clobbers the boot region →
+        boot-loop (image hash mismatch). This writes all three at their correct offsets.
+        bootloader+partitions are the Station's bundled stable boot assets (flash_boot/);
+        firmware is the per-version app from the cloud registry cache."""
+        if self.running:
+            return False
+        for f in (bootloader, partitions, firmware):
+            if not f or not os.path.exists(f):
+                self.error = f"Missing flash file: {os.path.basename(f or '?')}"
+                return False
+        self._thread = threading.Thread(
+            target=self._run, args=(port, bootloader, partitions, firmware), daemon=True
+        )
+        self._thread.start()
+        return True
+
     def start_image(self, port: str, image_path: str) -> bool:
-        """Flash a single MERGED factory image at 0x0 (the cloud-delivered
-        firmware.factory.bin from the firmware registry — see firmware_cache)."""
+        """Flash a single MERGED factory image at 0x0 (a real bootloader+partitions+app
+        merged image — NOT the registry's app-only firmware.bin, which must go through
+        start_three). Kept for a future cloud-delivered firmware.factory.bin."""
         if self.running:
             return False
         if not image_path or not os.path.exists(image_path):
