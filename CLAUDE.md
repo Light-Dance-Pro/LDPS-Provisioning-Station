@@ -89,11 +89,15 @@ Full as-built detail + real-HW verification: `LDPS-Hardware/docs/architecture/pr
 §13 (2026-07-02 entry) — auto-flow, §6.1 program-status/health-check/Safe-Mode fixes, hub Lock-page
 watchdog, verify page + warranty.
 
-**Commit model (2026-07-01):** the Station is the factory authority — **no manual confirm
-button**. It writes the identity to the hub (§6.1) / node (USB) and on the device's read-back
-success **auto-confirms** to Cloud (commit is server-side idempotent → retry-safe). If the
-write/read-back fails the operator gets **Release & start over** (free the quota slot, delete
-the reservation) or **Mark defective** (status `defected` → keeps the row + counts the quota
-slot for yield/RMA; the manufacturer requests more quota from us with cause). Abandoned
-`reserved` rows are reaped server-side after the stale window. Hub routes `/api/hub/{defect}`,
-node `/api/provision/defect`; cloud `defect_provision_{hub,node}` RPC + widened lifecycle CHECK.
+**Commit model (2026-07-01; hardened 2026-07-09):** the Station is the factory authority — **no
+manual confirm button**. It writes the identity to the hub (§6.1) / node (USB) and then commits
+to Cloud; **success is reported only after the commit lands** (bounded retries). The flow is
+**re-entrant**: a commit failure surfaces with the uuid + recovery key, and Retry passes
+`resume_uuid` back so the Station RESUMES the commit for its own write (never re-mints onto a
+written device, never adopts a foreign identity). `node_serial.write_identity` treats a
+refused-but-read-back-matching `P` as success (fw rejects same-value rewrites; a lost ack must
+not strand a good unit). Failure exits (both flows): **Retry** · **Clear identity & start over**
+(node, incl. the readiness panel) / **Release & start over** (hub, pre-commit only) · **Mark
+defective** (`defected` keeps the row + quota for yield/RMA — recoverable via admin revoke →
+re-provision since `20260709000000`). Abandoned `reserved` rows are reaped server-side after the
+stale window. Hub routes `/api/hub/{confirm,defect}`, node `/api/provision/{clear,defect}`.

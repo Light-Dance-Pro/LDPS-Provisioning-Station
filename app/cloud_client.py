@@ -86,15 +86,24 @@ class CloudClient:
             log(f"[Cloud] request-uuid error: {e}", "ERROR")
             return None
 
-    async def confirm(self, uuid: str, success: bool = True) -> bool:
+    async def confirm(self, uuid: str, success: bool = True) -> dict:
+        """COMMIT (identity written) or RELEASE (write failed → free quota).
+        Returns {ok, status, error} — status 0 = network error (retryable);
+        4xx = terminal (e.g. 404 reservation reaped/unknown, 409 wrong lifecycle)."""
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 r = await client.post(f"{self.cloud_url}/provision/confirm",
                                       json={"uuid": uuid, "success": success},
                                       headers=self._headers())
-            return r.status_code == 200
-        except Exception:
-            return False
+            err = ""
+            if r.status_code != 200:
+                try:
+                    err = r.json().get("error", "")
+                except Exception:
+                    err = r.text[:200]
+            return {"ok": r.status_code == 200, "status": r.status_code, "error": err}
+        except Exception as e:
+            return {"ok": False, "status": 0, "error": str(e)}
 
     async def defect(self, uuid: str, reason: str = "") -> bool:
         """Mark a reserved/provisioned node 'defected' (keeps row + quota for yield tracking)."""
@@ -159,16 +168,24 @@ class CloudClient:
             log(f"[Cloud] provision-hub error: {e}", "ERROR")
             return {"ok": False, "error": str(e)}
 
-    async def confirm_hub(self, hub_uuid: str, success: bool = True) -> bool:
-        """COMMIT (SD binding written) or RELEASE (write failed → frees the quota)."""
+    async def confirm_hub(self, hub_uuid: str, success: bool = True) -> dict:
+        """COMMIT (SD binding written) or RELEASE (write failed → frees the quota).
+        Returns {ok, status, error} — status 0 = network error (retryable);
+        4xx = terminal (404 reservation reaped/unknown, 409 wrong lifecycle)."""
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 r = await client.post(f"{self.cloud_url}/provision/hub/confirm",
                                       json={"hub_uuid": hub_uuid, "success": success},
                                       headers=self._headers())
-            return r.status_code == 200
-        except Exception:
-            return False
+            err = ""
+            if r.status_code != 200:
+                try:
+                    err = r.json().get("error", "")
+                except Exception:
+                    err = r.text[:200]
+            return {"ok": r.status_code == 200, "status": r.status_code, "error": err}
+        except Exception as e:
+            return {"ok": False, "status": 0, "error": str(e)}
 
     async def defect_hub(self, hub_uuid: str, reason: str = "") -> bool:
         """Mark a reserved/provisioned hub 'defected' (keeps row + quota for yield tracking)."""

@@ -89,7 +89,14 @@ class ProvisionLog:
         return [self._row_to_dict(r) for r in rows]
 
     def stats(self, manufacturer_id: str = "") -> dict:
-        today = datetime.date.today().isoformat()
+        # "Today" = the OPERATOR'S local calendar day. Timestamps are stored as UTC
+        # ("...Z"), so build the local day's [start, end) in UTC and range-compare —
+        # a LIKE on the UTC date string made the dashboard show 0 until 08:00 HK time.
+        local_midnight = datetime.datetime.combine(datetime.date.today(), datetime.time.min)
+        start_utc = local_midnight.astimezone(datetime.timezone.utc)
+        end_utc = start_utc + datetime.timedelta(days=1)
+        fmt = lambda dt: dt.replace(tzinfo=None).isoformat() + "Z"
+        today_range = (fmt(start_utc), fmt(end_utc))
         # All counts scoped to the logged-in manufacturer when given.
         scope = " AND manufacturer_id = ?" if manufacturer_id else ""
         mfr = (manufacturer_id,) if manufacturer_id else ()
@@ -103,8 +110,8 @@ class ProvisionLog:
             "total": _count(""),
             "success": _count(" AND status='success'"),
             "failed": _count(" AND status != 'success'"),
-            "today_success": _count(" AND status='success' AND timestamp LIKE ?", (today + "%",)),
-            "today_failed": _count(" AND status != 'success' AND timestamp LIKE ?", (today + "%",)),
+            "today_success": _count(" AND status='success' AND timestamp >= ? AND timestamp < ?", today_range),
+            "today_failed": _count(" AND status != 'success' AND timestamp >= ? AND timestamp < ?", today_range),
         }
 
     def _row_to_dict(self, row) -> dict:

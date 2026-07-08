@@ -1,6 +1,7 @@
 """Provisioning workflow routes."""
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import threading
@@ -70,8 +71,9 @@ async def discover(request: Request):
     s.discovered_nodes.clear()
     s.espnow.discover()
 
-    # Wait 3 seconds for responses
-    time.sleep(3)
+    # Wait 3 seconds for responses — async sleep: a time.sleep here stalled the whole
+    # event loop (every other HTTP/WS request) for the discovery window.
+    await asyncio.sleep(3)
 
     nodes = list(s.discovered_nodes.values())
     return {"ok": True, "nodes": nodes}
@@ -100,7 +102,9 @@ async def hw_test(request: Request, mac: str):
 
     try:
         s.espnow.hw_test(mac)
-        if not evt.wait(timeout=15):
+        # evt is set from the dongle RX thread; wait in a worker thread so the
+        # event loop keeps serving (a bare evt.wait blocked ALL requests for 15s).
+        if not await asyncio.to_thread(evt.wait, 15):
             return JSONResponse({"error": "HW_TEST timeout"}, 408)
         result = _pending_hw_test[mac].get("result")
         return {"ok": True, "mac": mac, "test_results": result}
@@ -110,15 +114,53 @@ async def hw_test(request: Request, mac: str):
 
 # ── Finalize (USB provision: cloud UUID + genuineness → write over USB) ──
 
+_RETRYABLE_HTTP = (0, 500, 502, 503, 504)   # 0 = network error
+
+
+async def _confirm_commit(s, uuid: str, attempts: int = 3) -> dict:
+    """Commit (reserved → provisioned) with bounded retries on transient failures.
+    Terminal 4xx (404 reservation reaped/unknown, 409 wrong lifecycle) returns
+    immediately — retrying those can never succeed."""
+    last = {"ok": False, "status": 0, "error": "not attempted"}
+    for attempt in range(max(1, attempts)):
+        last = await s.cloud_client.confirm(uuid, success=True)
+        if last["ok"] or last["status"] not in _RETRYABLE_HTTP:
+            return last
+        await asyncio.sleep(1.5 * (attempt + 1))
+    return last
+
+
+def _log_success(s, mac: str, uuid: str, product: str, firmware_ver: str,
+                 test_results, recovery_key: str) -> None:
+    from app.provision_log import ProvisionLog
+    if not getattr(s, "provision_log", None):
+        s.provision_log = ProvisionLog()
+    s.provision_log.add(
+        mac=mac, uuid=uuid, product_type=product,
+        firmware_ver=firmware_ver or "?", test_results=test_results,
+        status="success", cloud_confirmed=True, recovery_key=recovery_key,
+        manufacturer_id=getattr(getattr(s, "cloud_client", None), "manufacturer_id", ""),
+    )
+    s.stats_provisioned += 1
+    if s.ws:
+        s.ws.broadcast("stats", {"provisioned": s.stats_provisioned, "failed": s.stats_failed})
+        s.ws.broadcast("provision", {"step": "done", "mac": mac, "uuid": uuid,
+                                     "recovery_key": recovery_key})
+
+
 @router.post("/finalize/{mac}")
 async def finalize(request: Request, mac: str, data: dict = Body(...)):
     """USB provision: cloud request-uuid (uuid + Ed25519 genuineness signature) →
     write identity to the node over USB serial ('P') + read-back verify → cloud
     confirm. The dongle is NOT used for identity (that's USB) — only for RF QC
     (/hw-test). `mac` is the node's hardware id (cloud hardware_serial); the body
-    carries the USB `port`, `product_type` (required QC gate), `test_results`,
-    `firmware_ver`."""
-    import asyncio
+    carries the USB `port`, `product` (required QC gate), `test_results`,
+    `firmware_ver`.
+
+    RE-ENTRANT: success is only reported after the cloud commit lands. If the node was
+    already written (a previous attempt whose commit failed), a retry RESUMES the commit
+    for the node's own UUID instead of minting a new one — so 'Retry' after any network
+    blip converges to done, and the unit is never left half-committed silently."""
     from app.node_serial import write_identity, read_identity
 
     s = _s(request)
@@ -129,6 +171,9 @@ async def finalize(request: Request, mac: str, data: dict = Body(...)):
     product = data.get("product")   # the catalog product key (ADR-0008)
     test_results = data.get("test_results")
     firmware_ver = data.get("firmware_ver", "")
+    # recovery_key from a previous attempt of THIS unit (the UI passes it back on Retry
+    # so the resumed success can still print the box label).
+    prior_recovery_key = data.get("recovery_key") or ""
     if not port:
         return JSONResponse({"error": "port required (node USB serial port)"}, 400)
     if not product:
@@ -137,8 +182,8 @@ async def finalize(request: Request, mac: str, data: dict = Body(...)):
     # P1 GUARD — USB is the AUTHORITATIVE identity channel: it is the link we actually
     # write to, whereas the RF-discovered `mac` is a separate node that merely answered
     # over the air. Read the node on `port` over USB FIRST and verify it is the selected
-    # node AND blank, BEFORE minting/writing — else a UUID minted for MAC-A could be
-    # written into node-B on the wrong port (cloud serial ≠ the node's real MAC).
+    # node, BEFORE minting/writing — else a UUID minted for MAC-A could be written into
+    # node-B on the wrong port (cloud serial ≠ the node's real MAC).
     ident = await asyncio.to_thread(read_identity, port)
     usb_mac = (ident.get("mac") or "").upper()
     if not usb_mac:
@@ -146,13 +191,36 @@ async def finalize(request: Request, mac: str, data: dict = Body(...)):
     if mac and usb_mac != mac.upper():
         return JSONResponse({"error": f"Wrong node on {port}: USB MAC {usb_mac} ≠ selected {mac.upper()}. "
                                       f"Select the USB port of the node you discovered.", "code": "MAC_MISMATCH"}, 409)
+    hw_serial = usb_mac
+
     if ident.get("uuid"):
-        return JSONResponse({"error": f"Node already provisioned (UUID {ident['uuid']}). "
+        # Node already carries an identity. RESUME is allowed ONLY for the uuid THIS
+        # flow minted (the UI passes it back as `resume_uuid` on Retry) — a previous
+        # attempt wrote the node but the cloud commit was lost, so finish the commit
+        # (idempotent server-side). Any OTHER identity is foreign: never silently
+        # adopt it — the operator must Clear first.
+        uuid = ident["uuid"]
+        if data.get("resume_uuid") == uuid:
+            c = await _confirm_commit(s, uuid)
+            if c["ok"]:
+                _log_success(s, mac, uuid, product, firmware_ver, test_results, prior_recovery_key)
+                log(f"[Provision] RESUMED commit (USB): {mac} → {uuid}")
+                return {"ok": True, "mac": mac, "uuid": uuid, "key_id": ident.get("key_id"),
+                        "recovery_key": prior_recovery_key, "cloud_confirmed": True,
+                        "resumed": True}
+            if c["status"] in _RETRYABLE_HTTP:
+                return JSONResponse({"error": f"Node is written (UUID {uuid}) but the cloud commit "
+                                              f"is unreachable ({c['error']}). Retry when the network is back "
+                                              f"— Retry resumes this unit, it does not re-mint.",
+                                     "code": "CONFIRM_RETRYABLE", "uuid": uuid,
+                                     "recovery_key": prior_recovery_key}, 502)
+            return JSONResponse({"error": f"The cloud refuses the commit for {uuid} "
+                                          f"({c['error'] or 'no record'} — reservation likely expired). "
+                                          f"Clear the node identity and start over.",
+                                 "code": "ALREADY_PROVISIONED"}, 409)
+        return JSONResponse({"error": f"Node already provisioned (UUID {uuid}). "
                                       f"Clear its identity (Re-provision) before writing a new one.",
                              "code": "ALREADY_PROVISIONED"}, 409)
-    # The serial registered in the cloud is the USB-verified MAC (authoritative). It now
-    # equals `mac`, but using usb_mac makes the source-of-truth explicit.
-    hw_serial = usb_mac
 
     # Step 1: mint UUID + genuineness signature from Cloud.
     minted = await s.cloud_client.request_uuid(hw_serial, product, test_results, firmware_ver)
@@ -175,37 +243,31 @@ async def finalize(request: Request, mac: str, data: dict = Body(...)):
     try:
         w = await asyncio.to_thread(write_identity, port, uuid, sig, key_id)
     except Exception as e:
-        await s.cloud_client.confirm(uuid, success=False)
+        await s.cloud_client.confirm(uuid, success=False)   # release the reservation
         return JSONResponse({"error": f"USB write error on {port}: {e}"}, 500)
     if not w.get("ok"):
-        await s.cloud_client.confirm(uuid, success=False)
+        rel = await s.cloud_client.confirm(uuid, success=False)
+        if not rel["ok"]:
+            log(f"[Provision] release failed for {uuid} after write failure "
+                f"({rel['error']}) — reservation will be reaped server-side", "WARNING")
         return JSONResponse({"error": f"Node identity write failed: {w.get('detail')}"}, 500)
 
-    # Step 3: confirm with Cloud (reserved → provisioned).
-    confirmed = await s.cloud_client.confirm(uuid, success=True)
-    if not confirmed:
-        log(f"[Provision] Cloud confirm failed for {uuid}, but identity is written", "WARNING")
+    # Step 3: confirm with Cloud (reserved → provisioned) — success is gated on this.
+    c = await _confirm_commit(s, uuid)
+    if not c["ok"]:
+        log(f"[Provision] commit failed for {uuid} — identity IS written "
+            f"(status={c['status']} {c['error']})", "ERROR")
+        code = "CONFIRM_RETRYABLE" if c["status"] in _RETRYABLE_HTTP else "CONFIRM_TERMINAL"
+        hint = ("Retry resumes this unit (no re-mint)." if code == "CONFIRM_RETRYABLE"
+                else "The reservation is gone (expired/reaped) — Clear the node identity and start over.")
+        return JSONResponse({"error": f"Identity written to the node, but the cloud commit failed: "
+                                      f"{c['error'] or ('HTTP ' + str(c['status']))}. {hint}",
+                             "code": code, "uuid": uuid, "recovery_key": recovery_key}, 502)
 
-    # Log
-    from app.provision_log import ProvisionLog
-    if not getattr(s, "provision_log", None):
-        s.provision_log = ProvisionLog()
-    s.provision_log.add(
-        mac=mac, uuid=uuid, product_type=product,
-        firmware_ver=firmware_ver or "?", test_results=test_results,
-        status="success", cloud_confirmed=confirmed, recovery_key=recovery_key,
-        manufacturer_id=getattr(getattr(s, "cloud_client", None), "manufacturer_id", ""),
-    )
-
-    s.stats_provisioned += 1
-    if s.ws:
-        s.ws.broadcast("stats", {"provisioned": s.stats_provisioned, "failed": s.stats_failed})
-        s.ws.broadcast("provision", {"step": "done", "mac": mac, "uuid": uuid,
-                                     "recovery_key": recovery_key})
-
+    _log_success(s, mac, uuid, product, firmware_ver, test_results, recovery_key)
     log(f"[Provision] SUCCESS (USB): {mac} → {uuid} (key_id={key_id})")  # recovery_key NOT logged
     return {"ok": True, "mac": mac, "uuid": uuid, "key_id": key_id,
-            "recovery_key": recovery_key, "cloud_confirmed": confirmed}
+            "recovery_key": recovery_key, "cloud_confirmed": True}
 
 
 # ── QC fail recording (ST3 / DR-13) — the yield gate ─────────
@@ -311,8 +373,8 @@ async def playback_test(request: Request, mac: str):
     # Send PLAY_AND_CAPTURE (Probe starts capture then sends SX:PLAY)
     s.dongle.send("TB", f"PLAY_AND_CAPTURE,0,{pack_id},100,8000")
 
-    # Wait for result (8s capture + overhead)
-    if not evt.wait(timeout=25):
+    # Wait for result (8s capture + overhead) — threaded wait, don't block the loop.
+    if not await asyncio.to_thread(evt.wait, 25):
         _pending_capture.pop("active", None)
         if s.ws:
             s.ws.broadcast("playback_test", {"status": "timeout", "mac": mac})
@@ -392,7 +454,6 @@ async def read_node(request: Request, data: dict = Body(...)):
     lets the wizard pick a node by its REAL MAC + see its current identity WITHOUT relying
     on RF discover (which can return a different node, or miss it when the node's ESP-NOW
     channel ≠ the dongle's). Body: {port}."""
-    import asyncio
     from app.node_serial import read_identity
     port = (data or {}).get("port")
     if not port:
@@ -413,7 +474,6 @@ async def clear_node(request: Request, data: dict = Body(...)):
     """Un-provision the node over USB ('U') so it can be RE-provisioned WITHOUT a reflash
     (identity is write-once; re-mint needs a blank node). Clears uuid + genuineness + owner
     from NVS only — the SD (packs/logs) is untouched. Body: {port}."""
-    import asyncio
     from app.node_serial import clear_identity
     port = (data or {}).get("port")
     if not port:
@@ -434,7 +494,6 @@ async def detect_node(request: Request):
     with a 'MAC=' line, whereas the dongle just streams sx:/en: (no MAC=). Skips the port
     of an already-connected dongle (probing resets the ESP32-S3 → would drop its RF link).
     Returns {ok, nodes:[{port, mac, uuid, fw, provisioned}]}."""
-    import asyncio
     from app.node_serial import read_identity
     from app.utils import list_serial_ports
     s = _s(request)

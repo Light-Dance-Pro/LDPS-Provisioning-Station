@@ -66,7 +66,9 @@ async def hub_provision(request: Request, data: dict = Body(...)):
 
 @router.post("/confirm")
 async def hub_confirm(request: Request, data: dict = Body(...)):
-    """COMMIT (SD binding written + QC passed) or RELEASE (write/QC failed → free quota)."""
+    """COMMIT (SD binding written + QC passed) or RELEASE (write/QC failed → free quota).
+    Passes the cloud's status through so the GUI can tell a retryable network failure
+    (status 0/5xx) from a terminal one (404 reservation reaped, 409 wrong lifecycle)."""
     s = _s(request)
     if not _need_cloud(s):
         return JSONResponse({"error": "Not logged in to Cloud"}, 401)
@@ -75,18 +77,22 @@ async def hub_confirm(request: Request, data: dict = Body(...)):
     if not hub_uuid:
         return JSONResponse({"error": "hub_uuid required"}, 400)
 
-    ok = await s.cloud_client.confirm_hub(hub_uuid, success=success)
-    if ok and success:
+    c = await s.cloud_client.confirm_hub(hub_uuid, success=success)
+    if c["ok"] and success:
         s.stats_provisioned += 1
         s.hub_pending = None
         if s.ws:
             s.ws.broadcast("stats", {"provisioned": s.stats_provisioned, "failed": s.stats_failed})
             s.ws.broadcast("hub_provision", {"step": "done", "hub_uuid": hub_uuid})
         log(f"[HubProvision] COMMIT hub_uuid={hub_uuid}")
-    elif ok:
+    elif c["ok"]:
         s.hub_pending = None
         log(f"[HubProvision] RELEASE hub_uuid={hub_uuid} (quota freed)")
-    return {"ok": ok}
+    else:
+        log(f"[HubProvision] {'COMMIT' if success else 'RELEASE'} failed for {hub_uuid}: "
+            f"status={c['status']} {c['error']}", "WARNING")
+    return {"ok": c["ok"], "status": c["status"], "error": c["error"] or None,
+            "retryable": (not c["ok"]) and c["status"] in (0, 500, 502, 503, 504)}
 
 
 @router.post("/defect")

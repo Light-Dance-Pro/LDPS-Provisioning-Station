@@ -86,17 +86,23 @@ def connect_dongle(request: Request, data: dict = Body(...)):
 
 
 @router.post("/detect")
-def detect_dongle(request: Request):
+def detect_dongle(request: Request, data: dict = Body(default={})):
     """Auto-detect + connect the Test Board so the operator never picks a port.
     Probes each ESP32-S3 USB port with the DG:STATUS handshake — the dongle answers
-    dg:READY, an Edge-Node doesn't — and connects the one that does."""
+    dg:READY, an Edge-Node doesn't — and connects the one that does.
+
+    body.exclude: ports NOT to probe (the node's USB port). Opening a serial port can
+    reset the ESP32 on it — probing the node's port mid-flow (e.g. during the identity
+    write) could hard-reset the node under test. The GUI passes the known node port."""
     s = _s(request)
     if s.dongle and getattr(s.dongle, "connected", False) and s.dongle.ready:
         return {"ok": True, "port": s.dongle_port, "already": True}
 
+    exclude = set((data or {}).get("exclude") or [])
     from app.utils import list_serial_ports
     cand = [p["device"] for p in list_serial_ports()
-            if any(k in p["device"] for k in ("usbmodem", "ttyACM", "ttyUSB", "wchusbserial", "SLAB"))]
+            if any(k in p["device"] for k in ("usbmodem", "ttyACM", "ttyUSB", "wchusbserial", "SLAB"))
+            and p["device"] not in exclude]
     for port in cand:
         if _probe_is_dongle(port):
             return _connect_on_port(s, port, auto=True)

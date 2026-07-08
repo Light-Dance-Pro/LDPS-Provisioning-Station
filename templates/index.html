@@ -4,10 +4,11 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
   <title>LDPS Provisioning Station</title>
-  <script src="https://cdn.jsdelivr.net/npm/vue@3/dist/vue.global.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/feather-icons/dist/feather.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js"></script>
+  <!-- Vendored locally (static/vendor/) — the Station is a factory tool and must render
+       even when the internet is down (CDN scripts made the whole app shell depend on it). -->
+  <script src="/static/vendor/vue.global.prod.js"></script>
+  <script src="/static/vendor/axios.min.js"></script>
+  <script src="/static/vendor/qrcode.min.js"></script>
   <style>
     :root {
       --bg: #0f1117;
@@ -263,6 +264,13 @@
               <span style="min-width:140px;font-weight:600;">Cloud + quota</span>
               <span class="text-muted text-sm" style="flex:1;">[[ nodeReady.cloud ? ((provisionProductType||'node') + ' — quota available') : 'cloud offline or no quota' ]]</span>
             </div>
+            <!-- Blocked: the node on USB already carries an identity — give the operator the
+                 recovery action here (identity is write-once; re-provision needs a clear). -->
+            <div v-if="nodeReady.nodeBlocked" style="text-align:center;margin-top:10px;">
+              <button class="btn btn-danger" :disabled="nodeClearBusy" @click="readyClearNode">
+                [[ nodeClearBusy ? 'Clearing…' : 'Clear node identity (re-provision)' ]]</button>
+              <div class="text-muted" style="font-size:11px;margin-top:4px;">Wipes uuid + genuineness from the node's NVS so this unit can be provisioned again. The old cloud record (if any) stays — handle it in admin.</div>
+            </div>
           </div>
           <div style="text-align:center;margin-top:18px;">
             <button class="btn btn-primary" style="font-size:16px;padding:12px 34px;" :disabled="!nodeAllReady" @click="startNodeFlow">&#x25B6; Start</button>
@@ -303,11 +311,19 @@
             <div style="margin-top:10px;"><a href="#" class="text-sm" style="color:var(--muted);" @click.prevent="reIdentify">&#x21BB; light it again</a></div>
           </div>
 
-          <!-- FAILURE pause -->
+          <!-- FAILURE pause. Exits are state-aware:
+               · Retry — re-runs the failed step; a half-committed provision RESUMES (no re-mint).
+               · Clear identity & start over — only when the provision step is dead-ended on a
+                 written identity (expired reservation / foreign identity): wipes the node's NVS
+                 identity, then re-runs the provision step against a blank node.
+               · Mark node failed — the operator's final verdict on the UNIT (records yield). -->
           <div v-if="flowState === 'failed'" style="margin-top:16px;border:1px solid var(--error);border-radius:8px;background:rgba(239,68,68,0.07);padding:14px;">
             <div class="text-error" style="margin-bottom:10px;">&#x26A0; [[ flowFailMsg ]]</div>
-            <button class="btn btn-primary" @click="retryFlow">&#x21BB; Retry this step</button>
-            <button class="btn btn-outline" style="margin-left:8px;" @click="failNode">Mark node failed</button>
+            <button class="btn btn-primary" :disabled="nodeClearBusy" @click="retryFlow">&#x21BB; Retry this step</button>
+            <button v-if="flowFailCode === 'ALREADY_PROVISIONED' || flowFailCode === 'CONFIRM_TERMINAL'"
+                    class="btn btn-danger" style="margin-left:8px;" :disabled="nodeClearBusy" @click="flowClearRetry">
+              [[ nodeClearBusy ? 'Clearing…' : 'Clear identity & start over' ]]</button>
+            <button class="btn btn-outline" style="margin-left:8px;" :disabled="nodeClearBusy" @click="failNode">Mark node failed</button>
           </div>
 
           <!-- DONE -->
@@ -336,205 +352,12 @@
               <div class="text-muted" style="font-size:11px;margin-top:6px;text-align:left;">Scan the QR → public genuineness page: <span style="font-family:monospace;">[[ flowProvision.verifyUrl ]]</span></div>
             </div>
             <button class="btn btn-primary" @click="nextNode">Provision Next Node &#x25B6;</button>
+            <button class="btn btn-outline" style="margin-left:8px;" @click="flowDefect"
+                    title="Found defective after it got a UUID — keeps the cloud record + quota slot for yield/RMA tracking">Mark defective</button>
           </div>
         </div>
       </div>
 
-      <!-- OLD stepped wizard — hidden during cutover (removed once the auto-flow is verified) -->
-      <div class="wizard" v-if="false">
-        <div class="wizard-steps">
-          <div v-for="(step, i) in wizardSteps" class="wizard-step"
-               :class="{active: wizardIdx === i, done: step.status === 'done', fail: step.status === 'fail'}">
-            <div class="wizard-step-icon">
-              <template v-if="step.status === 'done'">&#x2713;</template>
-              <template v-else-if="step.status === 'fail'">&#x2717;</template>
-              <template v-else>[[ i + 1 ]]</template>
-            </div>
-            <span class="wizard-step-name">[[ step.name ]]</span>
-          </div>
-        </div>
-        <div class="wizard-content">
-          <div class="card">
-            <div class="card-title">[[ wizardSteps[wizardIdx].name ]]</div>
-            <div v-if="wizardFailMsg" class="text-error mb-16" style="padding:8px 12px;border:1px solid var(--error);border-radius:6px;background:rgba(239,68,68,0.08);">
-              ⚠ Set aside as failed — [[ wizardFailMsg ]]. <a href="#" @click.prevent="wizardReset" style="color:var(--accent);">Start next unit</a>
-            </div>
-
-            <!-- Step 0: Flash Firmware -->
-            <div v-if="wizardIdx === 0" style="padding:16px 0;">
-              <div class="row mb-16">
-                <select class="input" v-model="nodePort" style="flex:1">
-                  <option value="">Select Node USB port...</option>
-                  <option v-for="p in serialPorts" :value="p.device">[[ p.device ]]</option>
-                </select>
-                <button class="btn btn-outline" :disabled="wizardBusy || flashRunning" @click="wizardDetect" title="Auto-detect the node USB port">[[ wizardBusy ? 'Detecting…' : '🔍 Detect' ]]</button>
-                <button class="btn btn-primary" :disabled="!nodePort || flashRunning" @click="wizardFlash">Flash</button>
-                <button class="btn btn-outline" @click="wizardSkip">Skip</button>
-              </div>
-              <div v-if="flashRunning">
-                <div class="progress mb-8"><div class="progress-fill" :style="{width: flashProgress+'%'}"></div></div>
-                <div class="text-sm text-muted">[[ flashStatus ]]</div>
-              </div>
-              <div v-if="flashStatus === 'done'" class="text-success">Firmware flashed successfully</div>
-              <div v-if="flashStatus === 'error'" class="text-error">[[ flashError ]]</div>
-              <div v-if="formatStatus" class="text-sm text-muted" style="margin-top:6px;">[[ formatStatus ]]</div>
-            </div>
-
-            <!-- Step 1: Discover Node -->
-            <div v-if="wizardIdx === 1" style="padding:16px 0;">
-              <!-- Auto-detect over USB (recommended; no guessing the port, no RF dependency) -->
-              <button class="btn btn-primary mb-8" style="width:100%;" :disabled="wizardBusy" @click="wizardDetect">
-                [[ wizardBusy ? 'Detecting…' : '🔍 Detect node (USB)' ]]
-              </button>
-              <div class="row mb-8" style="gap:8px;align-items:center;">
-                <select class="input" v-model="nodePort" style="flex:1">
-                  <option value="">…or pick the USB port manually</option>
-                  <option v-for="p in serialPorts" :value="p.device">[[ p.device ]]</option>
-                </select>
-                <button class="btn btn-outline" :disabled="!nodePort || wizardBusy" @click="wizardReadUsb">Read</button>
-              </div>
-              <div class="text-muted text-sm mb-8" style="text-align:center;">— or scan over RF —</div>
-              <button class="btn btn-outline mb-16" :disabled="wizardBusy" @click="wizardDiscover">
-                [[ wizardBusy ? 'Scanning...' : 'Discover Nodes (RF)' ]]
-              </button>
-              <div v-if="discoveredNodes.length">
-                <table class="table">
-                  <tr><th>MAC</th><th>Firmware</th><th>UUID</th><th></th></tr>
-                  <tr v-for="n in discoveredNodes" @click="wizardSelectNode(n)" style="cursor:pointer;"
-                      :style="{background: selectedMac === n.mac ? 'rgba(59,130,246,0.15)' : ''}">
-                    <td>[[ n.mac ]]</td><td>[[ n.fw ]]</td>
-                    <td>[[ n.uuid || '(none)' ]]</td>
-                    <td><button class="btn btn-outline" style="padding:4px 8px;font-size:11px;" @click.stop="wizardIdentify(n.mac)">Identify</button></td>
-                  </tr>
-                </table>
-                <button v-if="selectedMac" class="btn btn-primary" style="margin-top:12px;" @click="wizardAdvance">
-                  Select [[ selectedMac ]]
-                </button>
-              </div>
-              <div v-else-if="!wizardBusy" class="text-muted">No nodes found. Click Discover to scan.</div>
-            </div>
-
-            <!-- Step 2: Hardware Test (RF self-check via the Test Board) -->
-            <div v-if="wizardIdx === 2" style="padding:16px 0;">
-              <div class="mb-8 text-muted">Node: [[ selectedMac ]]</div>
-              <!-- The RF hardware test runs over the Test Board (dongle). A missing/disconnected Test
-                   Board is an OPERATOR SETUP issue, NOT a node fault — guide to connect it; never fail
-                   the node for it (failing it would wrongly burn a quota slot + skew yield). -->
-              <div v-if="!dongleConnected" class="mb-16" style="padding:8px 12px;border:1px solid #f59e0b;border-radius:6px;background:rgba(245,158,11,0.10);color:#fbbf24;">
-                ⚠ Connect the <strong>Test Board (dongle)</strong> at the top of this page first — the hardware test runs over RF through it.
-              </div>
-              <button class="btn btn-primary mb-16" :disabled="wizardBusy || !dongleConnected" @click="wizardHwTest">
-                [[ wizardBusy ? 'Testing...' : 'Run Hardware Test' ]]
-              </button>
-              <!-- Transport/setup error (Test Board gone, RF timeout, node not responding): RETRY —
-                   don't auto-fail the node. A deliberate "node is faulty" escape hatch stays available. -->
-              <div v-if="hwTestResults && hwTestResults.error" class="mb-8">
-                <div style="padding:8px 12px;border:1px solid var(--error);border-radius:6px;background:rgba(239,68,68,0.08);" class="text-error">
-                  ⚠ Couldn't run the test: [[ hwTestResults.error ]].<br>
-                  This is a connection/setup issue, not a node fault — check the Test Board + node, then retry.
-                </div>
-                <div style="margin-top:12px;">
-                  <button class="btn btn-primary" :disabled="wizardBusy" @click="wizardHwTest">Retry</button>
-                  <button class="btn btn-outline" style="margin-left:8px;" @click="wizardFail('HW_TEST: node not responding')">Node is faulty — fail it</button>
-                </div>
-              </div>
-              <!-- Real node results (sd/rf/oled/ina/led/nvs …) -->
-              <div v-else-if="hwTestResults">
-                <table class="table">
-                  <tr><th>Test</th><th>Result</th></tr>
-                  <tr v-for="(val, key) in hwTestResults">
-                    <td>[[ key ]]</td>
-                    <td :class="val === true ? 'text-success' : (val === false ? 'text-error' : '')">[[ val ]]</td>
-                  </tr>
-                </table>
-                <div style="margin-top:12px;">
-                  <button v-if="hwTestPass" class="btn btn-success" @click="wizardAdvance">Tests Passed — Continue</button>
-                  <button v-else class="btn btn-danger" @click="wizardFail('HW_TEST failed')">Tests Failed</button>
-                </div>
-              </div>
-            </div>
-
-            <!-- Step 3: Visual Check — simplified production test: node self-check (step 2,
-                 incl. RF) + visual only; the test-pad Sync/Playback capture is removed. -->
-            <div v-if="wizardIdx === 3" style="padding:16px 0;">
-              <div class="mb-16">
-                <div class="mb-8">Is the OLED display showing correctly?</div>
-                <div class="row mb-16">
-                  <button class="btn btn-success" @click="visualOled = true" :style="{opacity: visualOled === true ? 1 : 0.5}">Yes</button>
-                  <button class="btn btn-danger" @click="visualOled = false" :style="{opacity: visualOled === false ? 1 : 0.5}">No</button>
-                </div>
-                <div class="mb-8">Are all LED channels lit correctly?</div>
-                <div class="row">
-                  <button class="btn btn-success" @click="visualLed = true" :style="{opacity: visualLed === true ? 1 : 0.5}">Yes</button>
-                  <button class="btn btn-danger" @click="visualLed = false" :style="{opacity: visualLed === false ? 1 : 0.5}">No</button>
-                </div>
-              </div>
-              <div v-if="visualOled !== null && visualLed !== null" style="margin-top:12px;">
-                <button v-if="visualOled && visualLed" class="btn btn-success" @click="wizardAdvance">Visual Check Passed</button>
-                <button v-else class="btn btn-danger" @click="wizardFail('Visual check failed')">Visual Check Failed</button>
-              </div>
-            </div>
-
-            <!-- Step 4: Provision UUID -->
-            <div v-if="wizardIdx === 4" style="padding:16px 0;">
-              <div class="mb-8 text-muted">Node: [[ selectedMac ]]</div>
-              <!-- Product type = the quota bucket to provision against (F-build operator picker;
-                   no hardcoded value). Options are THIS manufacturer's quota buckets. -->
-              <div class="mb-16" style="max-width:340px;">
-                <label class="text-sm text-muted">Product type (quota bucket)</label>
-                <select class="input" v-model="provisionProductType" style="width:100%;">
-                  <option v-for="q in nodeQuotas" :value="q.product" :disabled="q.quota - q.used <= 0">
-                    [[ q.product ]] — [[ q.quota - q.used ]] left
-                  </option>
-                </select>
-                <div v-if="!quotas.length" class="text-error text-sm mt-8">No quota buckets — log in to Cloud / assign quota first.</div>
-              </div>
-              <div class="mb-16">
-                <button class="btn btn-primary" :disabled="wizardBusy || !cloudReachable || !provisionProductType || !quotas.length" @click="wizardFinalize">
-                  [[ wizardBusy ? 'Provisioning...' : 'Provision Real UUID' ]]
-                </button>
-              </div>
-              <div v-if="provisionResult">
-                <div v-if="provisionResult.ok">
-                  <div class="text-success" style="font-size:18px;font-weight:700;">
-                    UUID: [[ provisionResult.uuid ]]
-                  </div>
-                  <div v-if="provisionResult.recovery_key"
-                       style="margin-top:12px;padding:12px;border:2px solid var(--accent);border-radius:8px;background:rgba(59,130,246,0.08);">
-                    <div class="text-muted" style="font-size:12px;text-transform:uppercase;letter-spacing:1px;">Recovery key — print on the box (shown once)</div>
-                    <div style="font-size:22px;font-weight:700;letter-spacing:2px;font-family:monospace;">[[ provisionResult.recovery_key ]]</div>
-                  </div>
-                  <div style="margin-top:12px;">
-                    <button class="btn btn-outline" :disabled="wizardBusy" @click="nodeDefect" title="Found defective after provisioning — keeps the record + quota for tracking">Mark defective</button>
-                  </div>
-                </div>
-                <div v-else class="text-error">
-                  [[ provisionResult.error ]]
-                  <div v-if="provisionResult.code === 'ALREADY_PROVISIONED'" style="margin-top:10px;">
-                    <button class="btn btn-outline" :disabled="wizardBusy" @click="wizardClear">
-                      [[ wizardBusy ? 'Clearing…' : 'Clear identity & re-provision' ]]
-                    </button>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <!-- Step 5: Done -->
-            <div v-if="wizardIdx === 5" style="padding:16px 0;text-align:center;">
-              <div style="font-size:64px;margin-bottom:16px;">&#x2705;</div>
-              <div style="font-size:20px;font-weight:700;margin-bottom:8px;">Node Provisioned Successfully</div>
-              <div class="text-muted mb-16">MAC: [[ selectedMac ]] — UUID: [[ provisionResult?.uuid || '?' ]]</div>
-              <div v-if="provisionResult?.recovery_key"
-                   style="margin:0 auto 16px;max-width:380px;padding:14px;border:2px solid var(--accent);border-radius:8px;background:rgba(59,130,246,0.08);">
-                <div class="text-muted" style="font-size:12px;text-transform:uppercase;letter-spacing:1px;">Recovery key — print on the box</div>
-                <div style="font-size:26px;font-weight:700;letter-spacing:3px;font-family:monospace;">[[ provisionResult.recovery_key ]]</div>
-              </div>
-              <button class="btn btn-primary" @click="wizardReset">Provision Next Node</button>
-            </div>
-
-          </div>
-        </div>
-      </div>
     </div>
 
     <!-- ═══ Provision Hub Tab (flow B — automated auto-flow, same philosophy as Provision Node) ═══ -->
@@ -587,10 +410,16 @@
             </div>
           </div>
 
-          <!-- FAILURE pause -->
+          <!-- FAILURE pause. Exits:
+               · Retry — re-runs the failed step; a written-but-uncommitted identity RESUMES the commit.
+               · Release & start over — operator abort (setup mistake, wrong unit): frees the quota
+                 slot + deletes the reservation. Refused once committed (use Mark defective then).
+               · Mark hub defective — final verdict on the UNIT: keeps row + quota for yield/RMA. -->
           <div v-if="hubFlowState === 'failed'" style="margin-top:16px;border:1px solid var(--error);border-radius:8px;background:rgba(239,68,68,0.07);padding:14px;">
             <div class="text-error" style="margin-bottom:10px;">&#x26A0; [[ hubFlowFailMsg ]]</div>
             <button class="btn btn-primary" @click="retryHubFlow">&#x21BB; Retry this step</button>
+            <button v-if="hubResult && hubResult.hub_uuid" class="btn btn-outline" style="margin-left:8px;" @click="hubReleaseFlow"
+                    title="Free the quota slot + delete the reservation (setup mistake, not a bad unit)">Release &amp; start over</button>
             <button class="btn btn-outline" style="margin-left:8px;" @click="hubFailUnit">Mark hub defective</button>
           </div>
 
@@ -616,98 +445,6 @@
               <div class="text-muted" style="font-size:11px;margin-top:6px;text-align:left;">Scan the QR → public genuineness page: <span style="font-family:monospace;">[[ hubFlowProvision.verifyUrl ]]</span></div>
             </div>
             <button class="btn btn-primary" @click="nextHub">Provision Next Hub &#x25B6;</button>
-          </div>
-        </div>
-      </div>
-
-      <!-- OLD stepped wizard — hidden during cutover (removed once auto-flow field-confirmed) -->
-      <div class="wizard" v-if="false">
-        <div class="wizard-steps">
-          <div v-for="(step, i) in hubSteps" class="wizard-step"
-               :class="{active: hubIdx === i, done: step.status === 'done', fail: step.status === 'fail'}">
-            <div class="wizard-step-icon">
-              <template v-if="step.status === 'done'">&#x2713;</template>
-              <template v-else-if="step.status === 'fail'">&#x2717;</template>
-              <template v-else>[[ i + 1 ]]</template>
-            </div>
-            <span class="wizard-step-name">[[ step.name ]]</span>
-          </div>
-        </div>
-        <div class="wizard-content">
-          <div class="card">
-            <div class="card-title">[[ hubSteps[hubIdx].name ]]</div>
-            <div class="text-muted text-sm mb-16">
-              Flow B: the Cloud signs a binding to this OPi's chip (cpuid); the Station writes the signed
-              identity to the hub's SD over the §6.1 channel (<code>[[ hubHost || 'hub' ]]</code>).
-            </div>
-
-            <!-- Step 0: Read cpuid -->
-            <div v-if="hubIdx === 0" style="padding:16px 0;">
-              <label class="text-sm text-muted">Hub cpuid (RK3566 chip id)</label>
-              <div class="row mb-16" style="gap:8px;align-items:stretch;">
-                <input class="input" v-model="hubCpuid" placeholder="read from the assembled OPi, or type it"
-                       style="flex:1;font-family:monospace;" />
-                <button class="btn btn-outline" :disabled="hubBusy" @click="hubReadCpuid">[[ hubBusy ? '…' : 'Read from hub' ]]</button>
-              </div>
-              <div v-if="hubError" class="text-error text-sm mb-8">[[ hubError ]]</div>
-              <button class="btn btn-primary" :disabled="!hubCpuid.trim()" @click="hubAdvance">Continue</button>
-            </div>
-
-            <!-- Step 1: Select product (HUB quota buckets only) -->
-            <div v-if="hubIdx === 1" style="padding:16px 0;">
-              <div class="mb-8 text-muted text-sm" style="font-family:monospace;">cpuid: [[ hubCpuid ]]</div>
-              <label class="text-sm text-muted">Hub product type (quota bucket)</label>
-              <select class="input mb-8" v-model="hubProductType" style="max-width:360px;width:100%;">
-                <option value="">Select product…</option>
-                <option v-for="q in hubQuotas" :value="q.product" :disabled="q.quota - q.used <= 0">
-                  [[ q.product ]] — [[ q.quota - q.used ]] left
-                </option>
-              </select>
-              <div v-if="cloudConnected && !hubQuotas.length" class="text-error text-sm mb-8">
-                No hub quota buckets — assign a quota on a hub-flow product in admin first.
-              </div>
-              <div><button class="btn btn-primary" :disabled="!hubProductType" @click="hubAdvance">Continue</button></div>
-            </div>
-
-            <!-- Step 2: Sign binding (mint + Cloud-sign) -->
-            <div v-if="hubIdx === 2" style="padding:16px 0;">
-              <div class="mb-16 text-muted text-sm">Mint <strong>hub_uuid</strong> + Cloud-sign the binding to cpuid <code>[[ hubCpuid ]]</code> ([[ hubProductType ]]).</div>
-              <button class="btn btn-primary" :disabled="hubBusy || !cloudReachable" @click="hubProvision">
-                [[ hubBusy ? 'Signing…' : 'Provision (mint + sign binding)' ]]</button>
-              <div v-if="hubError" class="text-error text-sm mt-8">[[ hubError ]]</div>
-            </div>
-
-            <!-- Step 3: Write to hub (§6.1) -->
-            <div v-if="hubIdx === 3" style="padding:16px 0;">
-              <div style="padding:14px;border-radius:8px;background:rgba(59,130,246,0.08);border:1px solid var(--border);">
-                <div class="text-success" style="font-weight:700;">✓ Binding signed</div>
-                <div class="text-sm" style="font-family:monospace;margin:8px 0;word-break:break-all;">
-                  hub_uuid: [[ hubResult?.hub_uuid ]]<br>key_id: [[ hubResult?.key_id ]] · sig: [[ (hubResult?.binding_signature||'').slice(0,32) ]]…
-                </div>
-                <div class="text-muted text-sm" style="margin-bottom:8px;">
-                  Write <code>hub_boot_identity.json</code> to the hub SD over the §6.1 channel
-                  (<code>[[ hubHost || 'hub' ]]</code>). The hub re-verifies against its own chip + writes;
-                  on that read-back success the Station <strong>auto-confirms</strong> to Cloud — no manual step.
-                </div>
-                <button class="btn btn-primary" :disabled="hubBusy" @click="hubWriteToHub">
-                  [[ hubBusy ? 'Writing & confirming…' : (hubError ? 'Retry write' : 'Write to Hub (§6.1) & confirm') ]]</button>
-                <div v-if="hubError" class="text-error text-sm mt-8">[[ hubError ]]</div>
-              </div>
-              <!-- recovery exits — a reservation (hub_uuid + quota) exists at this point -->
-              <div class="row" style="margin-top:12px;gap:8px;">
-                <button class="btn btn-outline" :disabled="hubBusy" @click="hubRelease" title="Free the quota slot + start over">Release &amp; start over</button>
-                <button class="btn btn-danger" :disabled="hubBusy" @click="hubDefect" title="Mark this unit defective — keeps the record + quota for tracking">Mark defective</button>
-              </div>
-            </div>
-
-            <!-- Step 4: Done -->
-            <div v-if="hubIdx === 4" style="padding:16px 0;text-align:center;">
-              <div style="font-size:64px;margin-bottom:16px;">&#x2705;</div>
-              <div style="font-size:20px;font-weight:700;margin-bottom:8px;">Hub Provisioned</div>
-              <div class="text-muted mb-16" style="font-family:monospace;">[[ hubDoneUuid ]]</div>
-              <button class="btn btn-primary" @click="hubReset">Provision Next Hub</button>
-            </div>
-
           </div>
         </div>
       </div>
@@ -777,19 +514,18 @@ Vue.createApp({
       cloudEmail: '',  // displays manufacturer name
       apiKey: '',
 
-      // Node flash
-      nodePort: '',
-      flashRunning: false,
-      provisionProductType: '',  // operator picks a quota bucket (F-build picker); set by loadQuota()
       // ── Auto-flow (automated node provisioning) ──
+      provisionProductType: '',  // operator picks a quota bucket (F-build picker); set by loadQuota()
       flowState: 'idle',         // idle | running | visual | failed | done
       flowProgress: 0,
       flowFailMsg: '',
+      flowFailCode: '',          // error code of the failed phase — drives which recovery exits show
       flowNodePort: '',          // node USB port (auto-resolved: the ESP32-S3 that isn't the dongle)
       flowMac: '',
       flowResults: {},           // accumulated test_results → cloud node.test_results + provision_log
       flowProvision: null,       // {uuid, recovery_key}
       flowPhaseIdx: 0,
+      nodeClearBusy: false,      // Clear-identity in progress (readiness/failed exits)
       nodeReady: { dongle: false, node: false, nodeBlocked: false, nodePort: '', nodeState: '', cloud: false, checking: false },
       nodeFlow: [
         { key: 'flash',    name: 'Flash firmware', status: 'pending', detail: '' },
@@ -799,38 +535,6 @@ Vue.createApp({
         { key: 'visual',   name: 'Visual check',   status: 'pending', detail: '' },
         { key: 'provision',name: 'Provision UUID', status: 'pending', detail: '' },
       ],
-      flashProgress: 0,
-      flashStatus: '',
-
-      // Stats
-      statsProvisioned: 0,
-      statsFailed: 0,
-
-      // Wizard
-      wizardIdx: 0,
-      wizardBusy: false,
-      wizardFailMsg: '',
-      wizardSteps: [
-        { name: 'Flash Firmware', status: 'pending' },
-        { name: 'Discover Node', status: 'pending' },
-        { name: 'Hardware Test', status: 'pending' },
-        { name: 'Visual Check', status: 'pending' },
-        { name: 'Provision UUID', status: 'pending' },
-        { name: 'Done', status: 'pending' },
-      ],
-      discoveredNodes: [],
-      selectedMac: '',
-      hwTestResults: null,
-      syncStatus: '',
-      syncDone: false,
-      visualOled: null,
-      visualLed: null,
-      provisionResult: null,
-      flashError: '',
-      formatStatus: '',
-      playbackResults: null,
-      playbackPass: false,
-      playbackStatus: '',
 
       // Dashboard
       quotas: [],
@@ -841,18 +545,9 @@ Vue.createApp({
       historySearch: '',
       historyFilter: '',
 
-      // Hub provisioning (flow B) — wizard mirrors the node wizard
-      hubIdx: 0,
-      hubSteps: [
-        { name: 'Read cpuid', status: 'pending' },
-        { name: 'Select product', status: 'pending' },
-        { name: 'Sign binding', status: 'pending' },
-        { name: 'Write & confirm', status: 'pending' },
-        { name: 'Done', status: 'pending' },
-      ],
+      // ── Hub auto-flow (flow B) ──
       hubCpuid: '',
       hubProductType: '',   // ST2: hub quota bucket
-      // ── Hub auto-flow ──
       hubFlowState: 'idle',      // idle | running | failed | done
       hubFlowProgress: 0,
       hubFlowFailMsg: '',
@@ -867,41 +562,14 @@ Vue.createApp({
         { key: 'write',   name: 'Write identity',     status: 'pending', detail: '' },
       ],
       hubResult: null,      // signed binding {hub_uuid, binding_signature, key_id, signing_keys}
-      hubError: '',
-      hubBusy: false,
-      hubWritten: false,    // §6.1 binding written to the OPi SD + hub unlocked
       hubHost: '',          // §6.1 channel target (from /api/hub/host)
-      hubDone: false,
-      hubDoneUuid: '',
 
       // WebSocket
       _ws: null,
-
-      // Overview page — canonical step guides (mirror the wizard step lists)
-      nodeGuide: [
-        { name: 'Flash Firmware', desc: 'Flash the node firmware over USB, then format its SD card.' },
-        { name: 'Discover Node', desc: 'Auto-detect over USB, or scan over RF, then pick the unit.' },
-        { name: 'Hardware Test', desc: 'On-board self-check (SD, NVS, LED) + RF check, over RF via the Test Board.' },
-        { name: 'Visual Check', desc: 'Operator confirms the OLED + LED channels look correct.' },
-        { name: 'Provision UUID', desc: 'Pick a quota bucket; Cloud mints + signs the UUID, written over USB.' },
-        { name: 'Done', desc: 'Print the recovery key on the box; start the next unit.' },
-      ],
-      hubGuide: [
-        { name: 'Read cpuid', desc: "Read the assembled OPi's chip id over the §6.1 channel, or type it." },
-        { name: 'Select product', desc: 'Choose the hub quota bucket to provision against.' },
-        { name: 'Sign binding', desc: 'Cloud mints hub_uuid + signs the binding to the cpuid.' },
-        { name: 'Write & confirm', desc: 'Write the signed identity to the hub SD over §6.1; the hub re-verifies + unlocks, and the Station auto-confirms to Cloud on read-back success.' },
-        { name: 'Done', desc: 'Hub registered; start the next hub. (Release / Mark-defective exits are available if the write fails.)' },
-      ],
     };
   },
 
   computed: {
-    hwTestPass() {
-      if (!this.hwTestResults) return false;
-      const r = this.hwTestResults;
-      return r.sd === true && r.rf === true && r.nvs === true && r.led === true;
-    },
     // ST2: split the quota buckets by family provision_flow so each picker shows its own.
     cloudUrlShort() { return (this.cloudUrl || '').replace(/^https?:\/\//, '').replace(/\/$/, ''); },
     envBadge() {
@@ -955,24 +623,17 @@ Vue.createApp({
     },
 
     // ── Dongle ──
-    async connectDongle() {
-      this.dongleError = '';
-      try {
-        const r = await axios.post('/api/dongle/connect', { port: this.donglePort });
-        if (r.data.ok) this.dongleConnected = true;
-        else this.dongleError = r.data.error || 'connect failed';
-      } catch (e) {
-        this.dongleError = 'Connect failed: ' + (e.response?.data?.error || e.message);
-      }
-    },
     // Auto-detect + connect the Test Board so the operator never has to know which
-    // /dev/cu.* the dongle is — the Station probes the ports and finds it.
+    // /dev/cu.* the dongle is — the Station probes the ports and finds it. The known
+    // NODE port is excluded from probing (opening a serial port can reset the ESP32 on
+    // it — probing the node mid-flow could hard-reset the unit under test).
     async detectDongle() {
       if (this.dongleDetecting || this.dongleConnected) return;
       this.dongleDetecting = true;
       this.dongleError = '';
       try {
-        const r = await axios.post('/api/dongle/detect');
+        const exclude = [this.flowNodePort, this.nodeReady.nodePort].filter(Boolean);
+        const r = await axios.post('/api/dongle/detect', { exclude });
         if (r.data.ok) { this.dongleConnected = true; this.donglePort = r.data.port; }
         else this.dongleError = r.data.error || 'no Test Board found';
       } catch (e) {
@@ -980,10 +641,6 @@ Vue.createApp({
       } finally {
         this.dongleDetecting = false;
       }
-    },
-    async disconnectDongle() {
-      await axios.post('/api/dongle/disconnect');
-      this.dongleConnected = false;
     },
 
     // ════════ Automated node provisioning (auto-flow) ════════
@@ -1016,7 +673,16 @@ Vue.createApp({
       // flickered the whole readiness panel (text/hint/button all flip).
       if (deep) this.nodeReady.checking = true;
       try {
-        if (!this.dongleConnected) { try { await this.detectDongle(); } catch (e) {} }
+        // Probe for a missing dongle at most every 15s on the idle poll (each probe opens
+        // candidate serial ports, which can reset the devices on them); a manual Re-check
+        // always probes.
+        if (!this.dongleConnected) {
+          const now = Date.now();
+          if (deep || !this._dongleProbeTs || now - this._dongleProbeTs > 15000) {
+            this._dongleProbeTs = now;
+            try { await this.detectDongle(); } catch (e) {}
+          }
+        }
         this.nodeReady.dongle = this.dongleConnected;
         this.nodeReady.cloud = this.cloudReachable && (this.nodeQuotas || []).some(q => (q.quota - q.used) > 0);
         await this.refreshPorts();
@@ -1044,9 +710,10 @@ Vue.createApp({
               this.nodeReady.nodeState = 'ready (blank · fw ' + (r.data.fw || '?') + ')';
             }
           } catch (e) {
-            // no serial response → a blank node with no firmware yet → ready (it gets flashed)
+            // No serial reply → ASSUMED to be a blank node (no firmware yet). If it's some
+            // other silent USB device, the flash step fails loudly (esptool can't sync).
             this.nodeReady.node = true; this.nodeReady.nodeBlocked = false;
-            this.nodeReady.nodeState = 'ready (no firmware — will flash)';
+            this.nodeReady.nodeState = 'no serial reply — assumed blank, will flash';
           }
         } else {
           this.nodeReady.node = !this.nodeReady.nodeBlocked;
@@ -1112,13 +779,13 @@ Vue.createApp({
     nextHub() {
       this.hubFlowState = 'idle';
       this.hubFlow.forEach(p => { p.status = 'pending'; p.detail = ''; });
-      this.hubFlowProvision = null; this.hubResult = null;
+      this.hubFlowProvision = null; this.hubResult = null; this._hubWroteIdentity = false;
       this._startHubReadyPoll();
     },
     startHubFlow() {
       this._stopHubReadyPoll();
       this.hubFlow.forEach(p => { p.status = 'pending'; p.detail = ''; });
-      this.hubFlowProvision = null; this.hubResult = null;
+      this.hubFlowProvision = null; this.hubResult = null; this._hubWroteIdentity = false;
       this.hubCpuid = this.hubReady.cpuid || this.hubCpuid;
       this.hubProductType = this._hubProductKey();
       this.hubFlowFailMsg = ''; this.hubFlowProgress = 0;
@@ -1142,14 +809,44 @@ Vue.createApp({
       this._runHubFlowFrom(this.hubFlowPhaseIdx);
     },
     async hubFailUnit() {
-      try {
-        if (this.hubResult && this.hubResult.hub_uuid) {
-          await axios.post('/api/hub/defect', { hub_uuid: this.hubResult.hub_uuid, reason: this.hubFlowFailMsg || 'QC failed at provisioning' });
+      // Mark defective: keeps the cloud row + quota slot for yield/RMA tracking. The
+      // result is CHECKED — a silently-failed defect left the reservation dangling.
+      if (this.hubResult && this.hubResult.hub_uuid) {
+        try {
+          const r = await axios.post('/api/hub/defect', { hub_uuid: this.hubResult.hub_uuid, reason: this.hubFlowFailMsg || 'QC failed at provisioning' });
+          if (!(r.data && r.data.ok)) { this.hubFlowFailMsg = 'Mark-defective failed (cloud rejected it) — check connectivity and retry.'; return; }
           this.loadQuota();
+        } catch (e) {
+          this.hubFlowFailMsg = 'Mark-defective failed: ' + (e.response?.data?.error || e.message);
+          return;
         }
-      } catch (e) { /* best-effort */ }
+      }
       this.hubFlowState = 'idle';
       this.hubFlow.forEach(p => { p.status = 'pending'; p.detail = ''; });
+      this.hubResult = null; this._hubWroteIdentity = false;
+      this._startHubReadyPoll();
+    },
+    async hubReleaseFlow() {
+      // Operator abort (setup mistake, wrong unit — NOT a defective hub): free the quota
+      // slot + delete the reservation, then start over. Only valid before the commit;
+      // after a commit the row is provisioned → use Mark-defective (or admin revoke).
+      if (this.hubResult && this.hubResult.hub_uuid) {
+        try {
+          const r = await axios.post('/api/hub/confirm', { hub_uuid: this.hubResult.hub_uuid, success: false });
+          if (!(r.data && r.data.ok)) {
+            this.hubFlowFailMsg = 'Release failed: ' + ((r.data && r.data.error) || 'cloud rejected it') +
+              (r.data && r.data.status === 409 ? ' — already committed; use Mark-defective instead.' : '');
+            return;
+          }
+          this.loadQuota();
+        } catch (e) {
+          this.hubFlowFailMsg = 'Release failed: ' + (e.response?.data?.error || e.message);
+          return;
+        }
+      }
+      this.hubFlowState = 'idle';
+      this.hubFlow.forEach(p => { p.status = 'pending'; p.detail = ''; });
+      this.hubResult = null; this._hubWroteIdentity = false;
       this._startHubReadyPoll();
     },
     _runHubPhase(key) {
@@ -1216,17 +913,43 @@ Vue.createApp({
       this._setHubPhase('sign', 'done', r.data.hub_uuid);
     },
     async _hubPhaseWrite() {
-      this._setHubPhase('write', 'running', 'Writing identity (§6.1) + confirming…');
-      let r;
+      // Step 1: write the signed binding to the hub over §6.1. RE-ENTRANT: if a previous
+      // attempt already wrote it, the hub's channel is closed (404 "already provisioned")
+      // — treat that as written and go finish the commit instead of failing.
+      this._setHubPhase('write', 'running', 'Writing identity (§6.1)…');
       try {
-        r = await axios.post('/api/hub/write-identity', {
+        const r = await axios.post('/api/hub/write-identity', {
           hub_uuid: this.hubResult.hub_uuid, cpuid: this.hubResult.cpuid || this.hubCpuid,
           binding_signature: this.hubResult.binding_signature, key_id: this.hubResult.key_id,
           signing_keys: this.hubResult.signing_keys,
         });
-      } catch (e) { throw new Error('Write failed: ' + ((e.response && e.response.data && e.response.data.error) || e.message)); }
-      if (!r.data || !r.data.ok || !r.data.provisioned) throw new Error('Write not confirmed: ' + ((r.data && r.data.error) || 'no ack'));
-      await axios.post('/api/hub/confirm', { hub_uuid: this.hubResult.hub_uuid, success: true }).catch(() => {});
+        if (!r.data || !r.data.ok || !r.data.provisioned) throw new Error('Write not confirmed: ' + ((r.data && r.data.error) || 'no ack'));
+        this._hubWroteIdentity = true;
+      } catch (e) {
+        const d = (e.response && e.response.data) || {};
+        // Channel closed (hub 404) AFTER our own write in this run = the earlier write
+        // landed and the hub provisioned itself — proceed to the commit, don't fail.
+        const closedAfterOurWrite = d.hub_status === 404 && this._hubWroteIdentity;
+        if (!closedAfterOurWrite) {
+          if (e instanceof Error && !e.response) throw e;
+          throw new Error('Write failed: ' + (d.error || e.message));
+        }
+      }
+      // Step 2: commit to Cloud — success is GATED on this (a silently-lost commit left
+      // a shipped hub the cloud didn't know about; reaped later = zombie identity).
+      this._setHubPhase('write', 'running', 'Identity written — committing to Cloud…');
+      let c;
+      try {
+        c = (await axios.post('/api/hub/confirm', { hub_uuid: this.hubResult.hub_uuid, success: true })).data;
+      } catch (e) {
+        c = { ok: false, retryable: true, error: (e.response?.data?.error || e.message) };
+      }
+      if (!c.ok) {
+        const hint = c.retryable
+          ? 'Retry resumes the commit (the identity is NOT re-written).'
+          : 'The reservation is gone (expired) — the hub must be RMA-cleared and re-provisioned.';
+        throw new Error('Identity written to the hub, but the Cloud commit failed: ' + (c.error || ('HTTP ' + c.status)) + '. ' + hint);
+      }
       this.hubFlowProvision = { hub_uuid: this.hubResult.hub_uuid, production_date: new Date().toISOString().slice(0, 10) };
       this._makeHubStickerQR();
       this._setHubPhase('write', 'done', this.hubResult.hub_uuid);
@@ -1246,6 +969,7 @@ Vue.createApp({
       this.flowState = 'idle';
       this.nodeFlow.forEach(p => { p.status = 'pending'; p.detail = ''; });
       this.flowProvision = null; this.flowResults = {}; this.flowMac = '';
+      this.flowFailCode = ''; this._pendingUuid = null; this._pendingRecoveryKey = '';
       this.nodeReady._readPort = '';   // force a fresh deep read for the next unit
       this._startReadyPoll();
     },
@@ -1253,6 +977,7 @@ Vue.createApp({
       this._stopReadyPoll();
       this.nodeFlow.forEach(p => { p.status = 'pending'; p.detail = ''; });
       this.flowResults = {}; this.flowProvision = null; this.flowMac = '';
+      this.flowFailCode = ''; this._pendingUuid = null; this._pendingRecoveryKey = '';
       this.flowNodePort = this.nodeReady.nodePort || '';   // the port the readiness check found
       this.flowFailMsg = ''; this.flowProgress = 0;
       await this._runFlowFrom(0);
@@ -1269,6 +994,7 @@ Vue.createApp({
         } catch (e) {
           ph.status = 'fail';
           this.flowFailMsg = (e && e.message) ? e.message : String(e);
+          this.flowFailCode = (e && e.code) || '';
           this.flowState = 'failed';
           return;
         }
@@ -1280,8 +1006,38 @@ Vue.createApp({
     retryFlow() {
       const ph = this.nodeFlow[this.flowPhaseIdx];
       if (ph) { ph.status = 'pending'; ph.detail = ''; }
-      this.flowFailMsg = '';
+      this.flowFailMsg = ''; this.flowFailCode = '';
       this._runFlowFrom(this.flowPhaseIdx);
+    },
+    // Clear the node's (write-once) identity over USB so it can be re-provisioned —
+    // used from the readiness panel (foreign/old identity) and from a provision-phase
+    // dead end (reservation expired → the written identity must be wiped to re-mint).
+    async clearNodeIdentity(port) {
+      if (!port || this.nodeClearBusy) return false;
+      this.nodeClearBusy = true;
+      try {
+        await axios.post('/api/provision/clear', { port });
+        return true;
+      } catch (e) {
+        const msg = 'Clear failed: ' + (e.response?.data?.error || e.message);
+        if (this.flowState === 'failed') this.flowFailMsg = msg;
+        else this.nodeReady.nodeState = msg;
+        return false;
+      } finally {
+        this.nodeClearBusy = false;
+      }
+    },
+    async readyClearNode() {
+      if (await this.clearNodeIdentity(this.nodeReady.nodePort)) {
+        this.nodeReady._readPort = '';    // force a fresh deep read
+        this.checkReady(true);
+      }
+    },
+    async flowClearRetry() {
+      if (await this.clearNodeIdentity(this.flowNodePort)) {
+        this._pendingUuid = null; this._pendingRecoveryKey = '';
+        this.retryFlow();                 // node is blank now → re-mint + write
+      }
     },
     async failNode() {
       try {
@@ -1292,8 +1048,27 @@ Vue.createApp({
       } catch (e) { /* yield record best-effort */ }
       this.flowState = 'idle';
       this.nodeFlow.forEach(p => { p.status = 'pending'; p.detail = ''; });
+      this.flowFailCode = ''; this._pendingUuid = null; this._pendingRecoveryKey = '';
       this.nodeReady._readPort = '';
       this._startReadyPoll();
+    },
+    // Found defective AFTER it got a UUID (done screen) — keeps the cloud row + quota
+    // slot for yield/RMA tracking, then resets for the next unit.
+    async flowDefect() {
+      if (!this.flowProvision || !this.flowProvision.uuid) return;
+      try {
+        const r = await axios.post('/api/provision/defect', {
+          uuid: this.flowProvision.uuid, reason: 'marked defective at provisioning' });
+        if (!(r.data && r.data.ok)) {
+          this.flowFailMsg = 'Mark-defective failed: ' + ((r.data && r.data.error) || 'cloud rejected it');
+          this.flowState = 'failed'; return;
+        }
+        this.loadQuota();
+      } catch (e) {
+        this.flowFailMsg = 'Mark-defective failed: ' + (e.response?.data?.error || e.message);
+        this.flowState = 'failed'; return;
+      }
+      this.nextNode();
     },
     _runPhase(key) {
       if (key === 'flash')     return this._phaseFlash();
@@ -1306,8 +1081,16 @@ Vue.createApp({
     },
     async _phaseFlash() {
       if (!this.flowNodePort) { await this.refreshPorts(); this.flowNodePort = this._resolveNodePort(); }
-      this._setPhase('flash', 'running', 'Flashing ' + this.flowNodePort + ' …');
-      await axios.post('/api/flash/start', { port: this.flowNodePort });
+      // Flash the firmware of the PICKED product bucket — the flash product and the
+      // provision product must be the same unit, not a hardcoded default.
+      const product = this._flowProductKey();
+      if (!product) throw new Error('No node quota bucket available — check the manufacturer quota.');
+      this._setPhase('flash', 'running', 'Flashing ' + product + ' on ' + this.flowNodePort + ' …');
+      try {
+        await axios.post('/api/flash/start', { port: this.flowNodePort, product });
+      } catch (e) {
+        throw new Error('Flash could not start: ' + (e.response?.data?.error || e.message));
+      }
       for (;;) {
         await this._flowSleep(1200);
         const st = (await axios.get('/api/flash/status')).data;
@@ -1380,13 +1163,32 @@ Vue.createApp({
         r = await axios.post('/api/provision/finalize/' + this.flowMac, {
           port: this.flowNodePort, product: product,
           test_results: this.flowResults, firmware_ver: this.flowResults.flash || '',
+          // Retry after "identity written but commit failed": pass the uuid back so
+          // finalize RESUMES the commit for OUR write instead of minting a new UUID
+          // (the recovery key rides along so the resumed done-screen can still print it).
+          resume_uuid: this._pendingUuid || undefined,
+          recovery_key: this._pendingRecoveryKey || undefined,
         });
       } catch (e) {
-        throw new Error('Provision failed: ' + (e.response?.data?.error || e.message));
+        const d = (e.response && e.response.data) || {};
+        // The unit may be half-committed (identity written, cloud commit failed) —
+        // remember its uuid + recovery key so Retry resumes instead of re-minting.
+        if (d.uuid) {
+          this._pendingUuid = d.uuid;
+          this._pendingRecoveryKey = d.recovery_key || this._pendingRecoveryKey || '';
+        }
+        const err = new Error('Provision failed: ' + (d.error || e.message));
+        err.code = d.code || '';
+        throw err;
       }
-      this.flowProvision = { uuid: r.data.uuid, recovery_key: r.data.recovery_key, production_date: new Date().toISOString().slice(0, 10) };
+      this.flowProvision = {
+        uuid: r.data.uuid,
+        recovery_key: r.data.recovery_key || this._pendingRecoveryKey || '',
+        production_date: new Date().toISOString().slice(0, 10),
+      };
+      this._pendingUuid = null; this._pendingRecoveryKey = '';
       this._makeStickerQR();
-      this._setPhase('provision', 'done', r.data.uuid);
+      this._setPhase('provision', 'done', r.data.uuid + (r.data.resumed ? ' (resumed commit)' : ''));
     },
     // Build the box-label QR (→ public verify page) for the sticker preview on the Done screen.
     _makeStickerQR(attempt) {
@@ -1461,219 +1263,6 @@ Vue.createApp({
       this.quotas = [];
     },
 
-    // ── Flash ──
-    async flashFirmware() {
-      try {
-        await axios.post('/api/flash/start', { port: this.nodePort });
-      } catch (e) {
-        alert('Flash failed: ' + (e.response?.data?.error || e.message));
-      }
-    },
-
-    // ── Wizard ──
-    wizardAdvance() {
-      this.wizardSteps[this.wizardIdx].status = 'done';
-      this.wizardIdx++;
-      this.wizardBusy = false;
-      this.wizardFailMsg = '';
-    },
-    wizardSkip() {
-      this.wizardSteps[this.wizardIdx].status = 'done';
-      this.wizardIdx++;
-    },
-    async wizardFail(reason) {
-      // ST3: record the failed unit to the cloud (no quota burn) + the yield, instead of the
-      // old alert()+local-only count. The backend broadcasts 'stats' → statsFailed updates via WS.
-      this.wizardSteps[this.wizardIdx].status = 'fail';
-      try {
-        if (this.selectedMac) {
-          await axios.post('/api/provision/report-fail/' + this.selectedMac, {
-            reason, product: this.provisionProductType, test_results: this.hwTestResults,
-          });
-        } else { this.statsFailed++; }
-      } catch (e) { this.statsFailed++; }
-      this.wizardFailMsg = reason;
-    },
-    wizardReset() {
-      this.wizardIdx = 0;
-      this.wizardSteps.forEach(s => s.status = 'pending');
-      this.discoveredNodes = [];
-      this.selectedMac = '';
-      this.hwTestResults = null;
-      this.syncStatus = '';
-      this.syncDone = false;
-      this.playbackResults = null;
-      this.playbackPass = false;
-      this.playbackStatus = '';
-      this.visualOled = null;
-      this.visualLed = null;
-      this.provisionResult = null;
-      this.formatStatus = '';
-      this.wizardFailMsg = '';
-    },
-    async wizardFlash() {
-      await this.flashFirmware();
-      // Flash status tracked via WebSocket; wizardPostFlash() runs when done
-    },
-    // Post-flash: the node just rebooted out of the flasher; format its SD to
-    // FAT32 so the production card starts clean, then advance. USB-only, factory step.
-    async wizardPostFlash() {
-      this.wizardBusy = true;
-      this.formatStatus = 'Node rebooting — waiting for SD to mount...';
-      // esptool `--after hard_reset` resets the node → its USB-CDC port re-enumerates
-      // (gone for several seconds). Wait out most of it; node_serial._open() then retries
-      // through the rest, so the format no longer fails with a stale-handle errno 19.
-      await new Promise(r => setTimeout(r, 8000));
-      this.formatStatus = 'Formatting SD card (FAT32)...';
-      try {
-        const r = await axios.post('/api/flash/format-sd', { port: this.nodePort });
-        this.formatStatus = 'SD formatted: ' + (r.data.detail || 'ok');
-      } catch (e) {
-        // Non-fatal: a blank/just-flashed node sometimes needs SD power-cycle; let
-        // the operator retry from the next step rather than block the whole flow.
-        this.formatStatus = 'SD format skipped: ' + (e.response?.data?.error || e.message);
-      }
-      this.wizardAdvance();
-    },
-    async wizardDiscover() {
-      this.wizardBusy = true;
-      this.discoveredNodes = [];
-      try {
-        const r = await axios.post('/api/provision/discover');
-        this.discoveredNodes = r.data.nodes || [];
-      } catch (e) { /* handled by WS */ }
-      this.wizardBusy = false;
-    },
-    wizardSelectNode(node) {
-      this.selectedMac = node.mac;
-    },
-    async wizardIdentify(mac) {
-      await axios.post('/api/provision/identify/' + mac);
-    },
-    async wizardHwTest() {
-      this.wizardBusy = true;
-      this.hwTestResults = null;
-      try {
-        const r = await axios.post('/api/provision/hw-test/' + this.selectedMac);
-        this.hwTestResults = r.data.test_results;
-      } catch (e) {
-        this.hwTestResults = { error: e.response?.data?.error || e.message };
-      }
-      this.wizardBusy = false;
-    },
-    async wizardPlaybackTest() {
-      this.wizardBusy = true;
-      this.playbackResults = null;
-      this.playbackPass = false;
-      this.playbackStatus = 'Starting WS2812 signal capture (8 channels, ~20s)...';
-      try {
-        const r = await axios.post('/api/provision/playback-test/' + this.selectedMac, {}, { timeout: 30000 });
-        this.playbackResults = r.data.tests || [];
-        this.playbackPass = r.data.pass || false;
-        this.playbackStatus = this.playbackPass ? 'All channels passed' : 'Some channels failed';
-      } catch (e) {
-        this.playbackStatus = 'Playback test failed: ' + (e.response?.data?.error || e.message);
-        this.playbackResults = null;
-      }
-      this.wizardBusy = false;
-    },
-    async wizardSync() {
-      this.wizardBusy = true;
-      this.syncStatus = 'Sending fake UUID + WiFi config...';
-      this.syncDone = false;
-      try {
-        const r = await axios.post('/api/provision/sync/' + this.selectedMac, {});
-        this.syncStatus = 'Sync triggered. Waiting for Node to download...';
-        // Poll STATUS_REQ for need_count=0 (simplified: wait 15s)
-        setTimeout(() => { this.syncStatus = 'Sync assumed complete (check Node display)'; this.syncDone = true; }, 15000);
-      } catch (e) {
-        this.syncStatus = 'Sync failed: ' + (e.response?.data?.error || e.message);
-      }
-      this.wizardBusy = false;
-    },
-    // Auto-detect the node's USB port (probes each serial port; the Edge-Node answers
-    // 'i' with a MAC, the dongle doesn't). Saves the operator guessing /dev/cu.* names.
-    async wizardDetect() {
-      this.wizardBusy = true;
-      this.provisionResult = null;
-      try {
-        const r = await axios.post('/api/provision/detect-node');
-        const nodes = r.data.nodes || [];
-        if (nodes.length === 1) {
-          this.nodePort = nodes[0].port;
-          this.selectedMac = nodes[0].mac;
-          this.discoveredNodes = [{ mac: nodes[0].mac, fw: nodes[0].fw, uuid: nodes[0].uuid, _usb: true }];
-        } else if (nodes.length === 0) {
-          this.provisionResult = { ok:false, error:'No node detected on USB — check the cable/connection.' };
-        } else {
-          this.discoveredNodes = nodes.map(n => ({ mac:n.mac, fw:n.fw, uuid:n.uuid, _usb:true }));
-          this.provisionResult = { ok:false, error: nodes.length + ' nodes on USB — select the port manually.' };
-        }
-      } catch (e) {
-        this.provisionResult = { ok:false, error: e.response?.data?.error || e.message };
-      }
-      this.wizardBusy = false;
-    },
-    // Identify the node over USB (authoritative — USB is the link we write to, and it
-    // doesn't depend on the RF/ESP-NOW channel like Discover does). Sets selectedMac to
-    // the node's REAL MAC so the finalize MAC-guard passes by construction.
-    async wizardReadUsb() {
-      if (!this.nodePort) { this.provisionResult = { ok:false, error:'Select the Node USB port first.' }; return; }
-      this.wizardBusy = true;
-      try {
-        const r = await axios.post('/api/provision/read-node', { port: this.nodePort });
-        const n = { mac: r.data.mac, fw: r.data.fw, uuid: r.data.uuid, _usb: true };
-        this.discoveredNodes = [n, ...this.discoveredNodes.filter(x => x.mac !== n.mac)];
-        this.selectedMac = n.mac;
-        this.provisionResult = null;
-      } catch (e) {
-        this.provisionResult = { ok:false, error: e.response?.data?.error || e.message };
-      }
-      this.wizardBusy = false;
-    },
-    // Re-provision without a reflash: 'U' over USB clears the (write-once) identity, then
-    // retry the mint+write. Used when finalize reports ALREADY_PROVISIONED.
-    async wizardClear() {
-      if (!this.nodePort) return;
-      this.wizardBusy = true;
-      try {
-        await axios.post('/api/provision/clear', { port: this.nodePort });
-        this.provisionResult = null;
-      } catch (e) {
-        this.provisionResult = { ok:false, error: e.response?.data?.error || e.message };
-        this.wizardBusy = false; return;
-      }
-      this.wizardBusy = false;
-      await this.wizardFinalize();   // node is blank now → re-attempt
-    },
-    async nodeDefect() {
-      // found defective after the node got a UUID — keep the row + quota for tracking, start over
-      if (!this.provisionResult?.uuid) return;
-      this.wizardBusy = true;
-      try { await axios.post('/api/provision/defect', { uuid: this.provisionResult.uuid, reason: 'marked defective at provisioning' }); this.loadQuota(); }
-      catch (e) { /* resetting regardless */ }
-      this.wizardBusy = false;
-      this.wizardReset();
-    },
-    async wizardFinalize() {
-      this.wizardBusy = true;
-      this.provisionResult = null;
-      try {
-        const r = await axios.post('/api/provision/finalize/' + this.selectedMac, {
-          port: this.nodePort,                  // node USB port (identity written over USB)
-          product: this.provisionProductType,   // the catalog product key — required by cloud QC gate
-          test_results: this.hwTestResults,
-        });
-        this.provisionResult = r.data;
-        if (r.data.ok) {
-          this.wizardAdvance();
-        }
-      } catch (e) {
-        this.provisionResult = { ok: false, error: e.response?.data?.error || e.message, code: e.response?.data?.code };
-      }
-      this.wizardBusy = false;
-    },
-
     // ── Dashboard + History ──
     async loadQuota() {
       try {
@@ -1689,99 +1278,10 @@ Vue.createApp({
       this.hubProductType = pick(this.hubQuotas, this.hubProductType);
     },
 
-    // ── Hub provisioning (flow B) ──
-    hubAdvance() {
-      this.hubSteps[this.hubIdx].status = 'done';
-      if (this.hubIdx < this.hubSteps.length - 1) this.hubIdx++;
-    },
-    async hubReadCpuid() {
-      // §6.1: read the assembled OPi's cpuid over the provisioning channel.
-      this.hubBusy = true; this.hubError = '';
-      try {
-        const r = await axios.get('/api/hub/read-cpuid');
-        if (r.data && r.data.ok) { this.hubCpuid = r.data.cpuid; this.hubHost = r.data.hub_host || this.hubHost; }
-        else this.hubError = (r.data && r.data.error) || 'read failed';
-      } catch (e) { this.hubError = e.response?.data?.error || e.message; }
-      this.hubBusy = false;
-    },
-    async hubProvision() {
-      this.hubBusy = true; this.hubError = ''; this.hubResult = null; this.hubWritten = false;
-      try {
-        const r = await axios.post('/api/hub/provision', {
-          cpuid: this.hubCpuid.trim(),
-          product: this.hubProductType,
-        });
-        if (r.data && r.data.ok) { this.hubResult = r.data; this.hubAdvance(); }
-        else this.hubError = (r.data && r.data.error) || 'provision failed';
-      } catch (e) { this.hubError = e.response?.data?.error || e.message; }
-      this.hubBusy = false;
-    },
-    async hubWriteToHub() {
-      // §6.1: write the cloud-signed binding onto the OPi's SD; the hub re-verifies its own
-      // chip + writes (read-back). On that success the Station AUTO-CONFIRMS to Cloud.
-      if (!this.hubResult) return;
-      this.hubBusy = true; this.hubError = '';
-      try {
-        const r = await axios.post('/api/hub/write-identity', {
-          hub_uuid: this.hubResult.hub_uuid,
-          cpuid: this.hubResult.cpuid || this.hubCpuid.trim(),
-          binding_signature: this.hubResult.binding_signature,
-          key_id: this.hubResult.key_id,
-          signing_keys: this.hubResult.signing_keys,
-        });
-        if (r.data && r.data.ok && r.data.provisioned) {
-          this.hubWritten = true;
-          await this.hubConfirm();   // read-back verified → auto-confirm, no manual step
-        } else this.hubError = (r.data && r.data.error) || 'write failed';
-      } catch (e) { this.hubError = e.response?.data?.error || e.message; }
-      this.hubBusy = false;
-    },
-    async hubConfirm() {
-      // commit (reserved → provisioned). Server-side idempotent, so a retried write is safe.
-      if (!this.hubResult) return;
-      try {
-        const r = await axios.post('/api/hub/confirm', { hub_uuid: this.hubResult.hub_uuid, success: true });
-        if (r.data && r.data.ok) {
-          this.hubDoneUuid = this.hubResult.hub_uuid; this.hubDone = true; this.hubAdvance();
-          this.loadQuota();
-        } else { this.hubError = (r.data && r.data.error) || 'confirm failed — retry write'; }
-      } catch (e) { this.hubError = e.response?.data?.error || e.message; }
-    },
-    async hubRelease() {
-      // operator abort: free the quota slot + delete the reservation, then start over
-      if (this.hubResult) {
-        this.hubBusy = true; this.hubError = '';
-        try { await axios.post('/api/hub/confirm', { hub_uuid: this.hubResult.hub_uuid, success: false }); this.loadQuota(); }
-        catch (e) { /* resetting regardless */ }
-        this.hubBusy = false;
-      }
-      this.hubReset();
-    },
-    async hubDefect() {
-      // mark this unit defective — keeps the row + quota slot for yield tracking, then start over
-      if (!this.hubResult) { this.hubReset(); return; }
-      this.hubBusy = true; this.hubError = '';
-      try {
-        const r = await axios.post('/api/hub/defect', { hub_uuid: this.hubResult.hub_uuid, reason: 'write/verify failed at provisioning' });
-        if (!(r.data && r.data.ok)) { this.hubError = 'defect failed'; this.hubBusy = false; return; }
-        this.loadQuota();
-      } catch (e) { this.hubError = e.response?.data?.error || e.message; this.hubBusy = false; return; }
-      this.hubBusy = false;
-      this.hubReset();
-    },
-    hubReset() {
-      this.hubIdx = 0;
-      this.hubSteps.forEach(s => s.status = 'pending');
-      this.hubCpuid = ''; this.hubProductType = ''; this.hubResult = null; this.hubError = '';
-      this.hubWritten = false; this.hubDone = false; this.hubDoneUuid = '';
-    },
-
     async loadDbStats() {
       try {
         const r = await axios.get('/api/history/stats');
         this.dbStats = r.data;
-        this.statsProvisioned = r.data.today_success || 0;
-        this.statsFailed = r.data.today_failed || 0;
       } catch (e) { /* silent */ }
     },
     async loadHistory() {
@@ -1805,6 +1305,9 @@ Vue.createApp({
     },
 
     onWsMessage(topic, data) {
+      // The auto-flows poll their own HTTP status endpoints; WS only carries the
+      // session-level signals (dongle link, cloud link, a provision landed → refresh
+      // the dashboard counters).
       if (topic === 'dongle') {
         this.dongleConnected = data.connected;
         if (data.connected && data.port) this.donglePort = data.port;
@@ -1816,20 +1319,8 @@ Vue.createApp({
       } else if (topic === 'cloud') {
         this.cloudConnected = data.connected;
         if (data.email) this.cloudEmail = data.email;
-      } else if (topic === 'flash') {
-        this.flashRunning = data.running;
-        this.flashProgress = data.progress || 0;
-        this.flashStatus = data.status || '';
-        this.flashError = data.error || '';
-        if (data.status === 'done' && this.wizardIdx === 0) this.wizardPostFlash();
-      } else if (topic === 'discovered') {
-        this.discoveredNodes = data.nodes || [];
-      } else if (topic === 'playback_test') {
-        if (data.status === 'starting') this.playbackStatus = 'Capture in progress...';
-        else if (data.status === 'result_received') this.playbackStatus = 'Analyzing results...';
       } else if (topic === 'stats') {
-        this.statsProvisioned = data.provisioned || 0;
-        this.statsFailed = data.failed || 0;
+        this.loadDbStats();
       }
     },
   },

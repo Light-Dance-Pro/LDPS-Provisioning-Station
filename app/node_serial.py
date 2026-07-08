@@ -62,7 +62,7 @@ def read_identity(port: str) -> dict:
     return {
         "uuid": grab(r"UUID:\s*([0-9a-fA-F-]{36})"),
         "key_id": grab(r"key_id=(\S+?)\s"),
-        "sig": grab(r"sig=([0-9a-f]{128})"),
+        "sig": grab(r"sig=([0-9a-fA-F]{128})").lower(),
         "fw": grab(r"FW:\s*(\S+)"),
         "mac": grab(r"MAC=([0-9A-Fa-f:]{17})"),
         "raw": t,
@@ -94,26 +94,48 @@ def clear_identity(port: str) -> dict:
     return {"ok": False, "detail": "no clear ack: " + resp[-160:].strip()}
 
 
+def _read_back_matches(port: str, uuid: str, sig: str, key_id: str,
+                       attempts: int = 5) -> dict:
+    """Re-read 'i' until the node reports exactly {uuid, sig, key_id}. RETRIED: the very
+    first read-back after 'P' sometimes comes back EMPTY (port close/reopen races the
+    node's USB-CDC), which falsely failed a write that actually stuck."""
+    ident = {}
+    for _ in range(max(1, attempts)):
+        ident = read_identity(port)
+        if (ident.get("uuid") == uuid and ident.get("sig") == sig.lower()
+                and ident.get("key_id") == key_id):
+            return {"ok": True, "ident": ident}
+        time.sleep(0.6)
+    return {"ok": False, "ident": ident}
+
+
 def write_identity(port: str, uuid: str, sig: str, key_id: str) -> dict:
     """Send 'P <uuid> <sig> <key_id>', then read back 'i' to verify the node
-    actually stored what we wrote. Returns {ok, uuid, sig, key_id, detail}."""
+    actually stored what we wrote. Returns {ok, uuid, sig, key_id, detail}.
+
+    IDEMPOTENT ON RETRY: if the node refuses the write (its firmware rejects 'P' once a
+    signature exists — including a retry of the SAME values after the ack line was lost),
+    we read the identity back and treat an exact match as success. Without this, a lost
+    '[PROV] identity written' line turned a fully-provisioned node into a false failure,
+    the cloud reservation got released, and the unit was stranded (node refuses a
+    different UUID forever)."""
     resp = _txn(port, f"P {uuid} {sig} {key_id}", wait=2.0)
     prov_lines = [l.strip() for l in resp.splitlines() if "[PROV]" in l]
     if not any("identity written" in l for l in prov_lines):
+        # Refused or no ack — the write may still have landed on an earlier attempt.
+        rb = _read_back_matches(port, uuid, sig, key_id, attempts=2)
+        if rb["ok"]:
+            log(f"[NodeSerial] write refused/no-ack on {port} but read-back matches — "
+                f"treating as already-written (idempotent retry)")
+            return {"ok": True, "uuid": uuid, "sig": sig, "key_id": key_id,
+                    "detail": "already written (read-back verified)"}
         return {"ok": False, "error": "write refused/no-ack",
                 "detail": prov_lines or resp[-200:].strip()}
-    # Read-back verification — the node must report exactly what we wrote. RETRY it: the
-    # write acked ('[PROV] identity written') but the very first 'i' read-back sometimes comes
-    # back EMPTY (the port close/reopen right after 'P' races the node's USB-CDC / it hasn't
-    # settled), which falsely failed a write that actually stuck. Re-read a few times.
-    ident = {}
-    for _ in range(5):
-        ident = read_identity(port)
-        if (ident.get("uuid") == uuid and ident.get("sig") == sig
-                and ident.get("key_id") == key_id):
-            return {"ok": True, "uuid": uuid, "sig": sig, "key_id": key_id,
-                    "detail": "read-back verified"}
-        time.sleep(0.6)
+    rb = _read_back_matches(port, uuid, sig, key_id)
+    if rb["ok"]:
+        return {"ok": True, "uuid": uuid, "sig": sig, "key_id": key_id,
+                "detail": "read-back verified"}
+    ident = rb["ident"]
     log(f"[NodeSerial] read-back mismatch on {port} after retries: "
         f"wrote uuid={uuid} kid={key_id}, read uuid={ident.get('uuid')} "
         f"kid={ident.get('key_id')}", "ERROR")

@@ -163,7 +163,8 @@ def create_app() -> FastAPI:
             await restore_session(state)
         except Exception as _e:
             log(f"[Factory] session restore skipped: {_e}", "WARNING")
-        log("[Factory] LDPS Factory started on port 9000")
+        from app.config import PORT
+        log(f"[Factory] LDPS Factory started on port {PORT}")
 
     @app.on_event("shutdown")
     def shutdown():
