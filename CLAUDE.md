@@ -81,7 +81,9 @@ Both device types provision through a one-Start **auto-flow** (not a stepped wiz
   **auto-detected** (dongle probe `DG:STATUS`→`dg:READY`; node by elimination), dongle auto-reconnects.
   Results → `provision_log` (scoped by `manufacturer_id`) + cloud `node.test_results`.
 - **Provision Hub (flow B):** Read cpuid (§6.1) → Push hub program → Flash dongle FW → Sign →
-  Write + confirm. Readiness = hub reachable on §6.1 & FRESH·cpuid + Touch-Hub quota.
+  Write + commit → **Restart & QC** (boot ok + healthz: engine + dongle alive — flow B §5 QC).
+  Program/dongle outcomes are run_id-matched (`program-status`/`dongle-status`). Readiness = hub
+  reachable on §6.1 & FRESH·cpuid + Touch-Hub quota.
 - On done, a **box label** preview (hi-res QR → public `/verify/<uuid>` + product + UUID + recovery
   key + production date). UI is English-only.
 
