@@ -560,6 +560,7 @@ Vue.createApp({
         { key: 'dongle',  name: 'Flash dongle FW',    status: 'pending', detail: '' },
         { key: 'sign',    name: 'Sign binding',       status: 'pending', detail: '' },
         { key: 'write',   name: 'Write identity',     status: 'pending', detail: '' },
+        { key: 'verify',  name: 'Restart & QC',       status: 'pending', detail: '' },
       ],
       hubResult: null,      // signed binding {hub_uuid, binding_signature, key_id, signing_keys}
       hubHost: '',          // §6.1 channel target (from /api/hub/host)
@@ -855,19 +856,30 @@ Vue.createApp({
       if (key === 'dongle') return this._hubPhaseDongle();
       if (key === 'sign') return this._hubPhaseSign();
       if (key === 'write') return this._hubPhaseWrite();
+      if (key === 'verify') return this._hubPhaseVerify();
       return Promise.resolve();
     },
-    // Poll §6.1 read-cpuid until the hub is back (program/dongle both restart ldps-hub).
-    async _hubWaitReady(label, timeoutMs) {
-      const end = Date.now() + (timeoutMs || 60000); let elapsed = 0;
+    // Poll a §6.1 status endpoint until OUR run_id reaches a terminal state. The hub
+    // restarts mid-operation (polls fail → keep trying); a run_id that never appears or
+    // a foreign run_id after the deadline = unknown outcome = failure (never assume ok).
+    async _hubPollRunStatus(url, runId, label, terminal, timeoutMs) {
       const key = this.hubFlow[this.hubFlowPhaseIdx].key;
+      const end = Date.now() + timeoutMs; let elapsed = 0;
+      let last = 'none';
       while (Date.now() < end) {
         await this._flowSleep(3000); elapsed += 3;
-        if (label) this._setHubPhase(key, 'running', label + ' — hub restarting… (' + elapsed + 's)');
-        try { const r = await axios.get('/api/hub/read-cpuid', { timeout: 4000 }); if (r.data && r.data.cpuid) return true; }
-        catch (e) { /* still down */ }
+        this._setHubPhase(key, 'running', label + '… (' + elapsed + 's, ' + last + ')');
+        try {
+          const r = await axios.get(url, { timeout: 4000 });
+          if (r.data && r.data.run_id === runId) {
+            last = r.data.status || 'none';
+            if (terminal.indexOf(last) >= 0) return last;
+          } else if (r.data && r.data.status) {
+            last = 'stale:' + r.data.status;   // someone else's / previous result — ignore
+          }
+        } catch (e) { last = 'hub restarting'; }
       }
-      return false;
+      return null;   // deadline — unknown outcome
     },
     async _hubPhaseCpuid() {
       this._setHubPhase('cpuid', 'running', 'Reading cpuid over §6.1…');
@@ -881,27 +893,30 @@ Vue.createApp({
       let r;
       try { r = await axios.post('/api/hub/push-program'); }
       catch (e) { throw new Error('Push program failed: ' + ((e.response && e.response.data && e.response.data.error) || e.message)); }
-      const back = await this._hubWaitReady('program installed', 90000);
-      if (!back) throw new Error('Hub did not come back after the program install — check /tmp/program_install.log on the hub.');
-      // The push is detached, so poll the install OUTCOME — a rolled-back install must NOT pass.
-      let st = 'none';
-      for (let i = 0; i < 15; i++) {
-        try { const s = await axios.get('/api/hub/program-status'); st = (s.data && s.data.status) || 'none'; } catch (e) { st = 'none'; }
-        if (st === 'ok' || st === 'rollback') break;
-        await this._flowSleep(2000);
-      }
+      const runId = r.data && r.data.run_id;
+      if (!runId) throw new Error('Hub did not return a run_id for the program install (old hub program on the SD?) — push aborted.');
+      // FRESH-hub install (backup→extract→restart→health-check) can take 40-120s.
+      const st = await this._hubPollRunStatus('/api/hub/program-status', runId, 'Installing',
+        ['ok', 'rollback', 'rollback_failed', 'backup_failed'], 180000);
+      if (st === null) throw new Error('Program install outcome unknown after 3min (run_id never reached a terminal state) — check /tmp/program_install.log on the hub.');
+      if (st === 'backup_failed') throw new Error('Program install ABORTED: the hub could not back up the current program (disk?) — nothing was changed. See /tmp/program_install.log.');
       if (st === 'rollback') throw new Error('Program install failed the hub health-check → rolled back. See /tmp/program_install.log on the hub.');
+      if (st === 'rollback_failed') throw new Error('Program install failed AND the rollback failed — the hub program may be broken. Inspect the hub before continuing.');
       const v = (r.data && r.data.version) ? ('v' + r.data.version) : 'installed';
-      this._setHubPhase('program', 'done', v + (st === 'ok' ? ' · healthy' : ''));
+      this._setHubPhase('program', 'done', v + ' · healthy');
     },
     async _hubPhaseDongle() {
       this._setHubPhase('dongle', 'running', 'Flashing the hub\'s dongle…');
       let r;
       try { r = await axios.post('/api/hub/flash-dongle'); }
       catch (e) { throw new Error('Dongle flash failed: ' + ((e.response && e.response.data && e.response.data.error) || e.message)); }
-      const back = await this._hubWaitReady('dongle flashing', 90000);
-      if (!back) throw new Error('Hub did not come back after the dongle flash — check /tmp/dongle_flash.log on the hub.');
-      this._setHubPhase('dongle', 'done', (r.data && r.data.version) ? ('RF Bridge v' + r.data.version) : 'flashed');
+      const runId = r.data && r.data.run_id;
+      if (!runId) throw new Error('Hub did not return a run_id for the dongle flash (old hub program on the SD?) — flash outcome unknowable.');
+      const st = await this._hubPollRunStatus('/api/hub/dongle-status', runId, 'Flashing dongle',
+        ['ok', 'failed'], 180000);
+      if (st === null) throw new Error('Dongle flash outcome unknown after 3min — check /tmp/dongle_flash.log on the hub.');
+      if (st === 'failed') throw new Error('Dongle flash FAILED (esptool rc≠0) — see /tmp/dongle_flash.log on the hub. Check the dongle is seated on ' + 'its USB.');
+      this._setHubPhase('dongle', 'done', (r.data && r.data.version) ? ('RF Bridge v' + r.data.version + ' · flashed') : 'flashed');
     },
     async _hubPhaseSign() {
       const product = this._hubProductKey();
@@ -950,9 +965,41 @@ Vue.createApp({
           : 'The reservation is gone (expired) — the hub must be RMA-cleared and re-provisioned.';
         throw new Error('Identity written to the hub, but the Cloud commit failed: ' + (c.error || ('HTTP ' + c.status)) + '. ' + hint);
       }
+      this._setHubPhase('write', 'done', this.hubResult.hub_uuid);
+    },
+    // Restart & QC (flow B §5): the §6.1 write unlocks the hub IN PLACE but its control
+    // plane (Dongle/engine/RF) only starts at boot — without this phase a hub could ship
+    // LOOKING provisioned but RF-dead. Drives the hub restart, then proves it operates:
+    // boot-status ok + main loop alive + dongle open.
+    async _hubPhaseVerify() {
+      this._setHubPhase('verify', 'running', 'Restarting the hub…');
+      try { await axios.post('/api/hub/restart'); }
+      catch (e) {
+        const d = (e.response && e.response.data) || {};
+        // 409 "already fully running" = it restarted on its own / a retry — proceed to QC.
+        if (d.hub_status !== 409 && !/already fully running/i.test(d.error || '')) {
+          throw new Error('Hub restart failed: ' + (d.error || e.message));
+        }
+      }
+      const end = Date.now() + 120000; let elapsed = 0; let boot = null, health = null;
+      while (Date.now() < end) {
+        await this._flowSleep(3000); elapsed += 3;
+        this._setHubPhase('verify', 'running', 'Waiting for the hub to come back… (' + elapsed + 's)');
+        try {
+          const r = await axios.get('/api/hub/status', { timeout: 4000 });
+          boot = r.data && r.data.boot; health = r.data && r.data.health;
+          if (boot && boot.boot_verified && !boot.locked && health && health.ok) break;
+        } catch (e) { /* still restarting */ }
+      }
+      if (!boot || !boot.boot_verified || boot.locked) {
+        throw new Error('Hub did not come back VERIFIED after the restart (boot: ' + JSON.stringify(boot) + ') — its identity may not have persisted.');
+      }
+      if (!health || !health.ok) {
+        throw new Error('Hub booted but is NOT operational (healthz: ' + JSON.stringify(health || {}) + ') — main loop or dongle down. Do not ship this unit as-is.');
+      }
       this.hubFlowProvision = { hub_uuid: this.hubResult.hub_uuid, production_date: new Date().toISOString().slice(0, 10) };
       this._makeHubStickerQR();
-      this._setHubPhase('write', 'done', this.hubResult.hub_uuid);
+      this._setHubPhase('verify', 'done', 'boot ok · engine + dongle alive');
     },
     _makeHubStickerQR(attempt) {
       const fp = this.hubFlowProvision;

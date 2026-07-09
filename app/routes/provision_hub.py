@@ -268,13 +268,70 @@ async def hub_push_program(request: Request):
 
 @router.get("/program-status")
 async def hub_program_status():
-    """Proxy the hub's program-install outcome (installing | ok | rollback | none) so the
-    auto-flow can tell a HEALTHY install from a rolled-back one (the /program push is
-    detached and can't report the result itself)."""
+    """Proxy the hub's program-install outcome {run_id, status: installing|ok|rollback|
+    rollback_failed|backup_failed|none}. The auto-flow matches run_id against its own
+    push — a stale status file (previous attempt / reboot-wiped) is never mistaken for
+    this push's result."""
     url = f"{HUB_HOST}/api/provision/program-status"
     try:
         async with httpx.AsyncClient(timeout=6) as c:
             r = await c.get(url)
         return r.json()
+    except Exception as e:
+        return JSONResponse({"error": f"cannot reach hub at {HUB_HOST} ({e})"}, 502)
+
+
+@router.get("/dongle-status")
+async def hub_dongle_status():
+    """Proxy the hub's dongle-flash outcome {run_id, status: flashing|ok|failed|none} —
+    before this, an esptool rc≠0 was indistinguishable from success (result only lived
+    in /tmp/dongle_flash.log on the hub)."""
+    url = f"{HUB_HOST}/api/provision/dongle-status"
+    try:
+        async with httpx.AsyncClient(timeout=6) as c:
+            r = await c.get(url)
+        return r.json()
+    except Exception as e:
+        return JSONResponse({"error": f"cannot reach hub at {HUB_HOST} ({e})"}, 502)
+
+
+@router.post("/restart")
+async def hub_restart():
+    """Ask the just-provisioned hub to restart (hub route is valid ONLY in the
+    verified-but-control-plane-inert state right after a §6.1 identity write). The
+    in-place unlock leaves the hub LOOKING provisioned but RF-dead until a restart —
+    the auto-flow's verify phase drives this + checks the hub comes back healthy."""
+    url = f"{HUB_HOST}/api/provision/restart"
+    try:
+        async with httpx.AsyncClient(timeout=8) as c:
+            r = await c.post(url)
+        try:
+            body = r.json()
+        except Exception:
+            body = {"body": r.text[:200]}
+        if r.status_code != 200:
+            return JSONResponse({"error": "hub refused the restart", "hub_status": r.status_code, **body},
+                                r.status_code if r.status_code in (404, 409) else 502)
+        return {"ok": True, **body}
+    except Exception as e:
+        return JSONResponse({"error": f"cannot reach hub at {HUB_HOST} ({e})"}, 502)
+
+
+@router.get("/status")
+async def hub_status():
+    """Post-restart QC probe: the hub's boot-status + healthz (main loop alive, dongle
+    open) so the verify phase can prove the provisioned hub actually OPERATES — not just
+    that its identity file verifies."""
+    out = {}
+    try:
+        async with httpx.AsyncClient(timeout=6) as c:
+            b = await c.get(f"{HUB_HOST}/api/system/boot-status")
+            out["boot"] = b.json()
+            try:
+                h = await c.get(f"{HUB_HOST}/api/healthz")
+                out["health"] = h.json() if h.status_code == 200 else {"ok": False, "http": h.status_code}
+            except Exception as he:
+                out["health"] = {"ok": False, "error": str(he)}
+        return {"ok": True, **out}
     except Exception as e:
         return JSONResponse({"error": f"cannot reach hub at {HUB_HOST} ({e})"}, 502)
