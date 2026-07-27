@@ -62,6 +62,13 @@ class ESPNowChannel:
         if comma < 1:
             return
         mac = payload[:comma]
+        # Dongle fw >= 1.2.5 appends the dongle-measured RX RSSI to the MAC
+        # ("MAC@-42,payload"); older fw sends the bare MAC. Strip it, or every
+        # MAC-keyed lookup (discovered_nodes, _pending_hw_test/…) misses —
+        # tolerant both ways, same as the Hub's parser.
+        at = mac.find("@")
+        if at > 0:
+            mac = mac[:at]
         rest = payload[comma + 1:]
         for cb in list(self._rx_callbacks):
             try:

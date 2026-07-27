@@ -55,20 +55,30 @@ def _connect_on_port(s, port: str, auto: bool = False):
     return {"ok": True, "port": port, "auto": auto}
 
 
-def _probe_is_dongle(port: str, timeout: float = 2.5) -> bool:
+def _probe_is_dongle(port: str, timeout: float = 6.0) -> bool:
     """Does a real Dongle answer the DG:STATUS handshake (dg:READY) on `port`? An
     Edge-Node does not. Opens + polls a throwaway handle, then closes it either way —
-    so /detect can tell the dongle apart from the node without the operator guessing."""
+    so /detect can tell the dongle apart from the node without the operator guessing.
+
+    Opening the port RESETS the board (USB-JTAG DTR), so the single DG:STATUS sent
+    at open lands mid-boot and is lost. Dongle fw 1.2.6 boots in ~2-3 s (NVS SXP
+    replay + WDT init — slower than 1.1.x), which the old one-shot + 2.5 s window
+    just missed. Re-send DG:STATUS through the whole window instead: the first one
+    after the app is up gets an immediate dg:READY."""
     from app.dongle import DongleSerial
     d = DongleSerial(port)
     if not d.open():
         return False
     try:
         end = time.time() + timeout
+        next_send = time.time() + 0.8
         while time.time() < end:
             d.poll()
             if d.ready:
                 return True
+            if time.time() >= next_send:
+                d.send("DG", "STATUS")
+                next_send = time.time() + 0.8
             time.sleep(0.1)
         return False
     finally:
