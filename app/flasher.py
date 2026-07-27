@@ -94,7 +94,7 @@ class Flasher:
             sys.stderr = captured
             esptool.main([
                 "--port", port, "--baud", "921600", "--chip", "esp32s3",
-                "write_flash", "0x0", image,
+                "write-flash", "0x0", image,
             ])
             flashed = True
         except SystemExit as e:
@@ -196,7 +196,7 @@ class Flasher:
                 "--port", port,
                 "--baud", "921600",
                 "--chip", "esp32s3",
-                "write_flash",
+                "write-flash",
                 "0x0000", bootloader,
                 "0x8000", partitions,
                 "0x10000", firmware,
