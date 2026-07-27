@@ -31,7 +31,18 @@ def _setup_espnow_handler(state: AppState, espnow) -> None:
                 state.ws.broadcast("discovered", {"nodes": list(state.discovered_nodes.values())})
 
         elif cmd == "HW_TEST_ACK":
-            if state.ws:
+            # "HW_TEST_ACK,err,<reason>" is a refusal (await_uuid/busy/show_active/
+            # not_ready) — resolve the pending wait NOW with the reason. Treating
+            # every ACK as "running" masked the node's NACK as the generic 15s
+            # timeout (how the 2.3.51 AWAIT_UUID regression hid).
+            if len(parts) > 1 and parts[1] == "err":
+                reason = parts[2] if len(parts) > 2 else "refused"
+                from app.routes.provision import handle_hw_test_nack
+                handle_hw_test_nack(mac, reason)
+                if state.ws:
+                    state.ws.broadcast("hw_test", {"mac": mac, "status": "refused",
+                                                   "reason": reason})
+            elif state.ws:
                 state.ws.broadcast("hw_test", {"mac": mac, "status": "running"})
 
         elif cmd == "HW_TEST_RESULT":

@@ -34,6 +34,15 @@ def _s(r: Request):
 
 # ── ESP-NOW Response Handlers (called from __init__.py) ────
 
+def handle_hw_test_nack(mac: str, reason: str) -> None:
+    """Node refused HW_TEST (HW_TEST_ACK,err,<reason>) — fail the wait immediately
+    with the reason instead of letting it die as a 15s timeout."""
+    pending = _pending_hw_test.get(mac)
+    if pending:
+        pending["result"] = {"refused": reason}
+        pending["event"].set()
+
+
 def handle_hw_test_result(mac: str, parts: list[str]) -> None:
     json_str = ",".join(parts[1:]) if len(parts) > 1 else "{}"
     try:
@@ -107,6 +116,8 @@ async def hw_test(request: Request, mac: str):
         if not await asyncio.to_thread(evt.wait, 15):
             return JSONResponse({"error": "HW_TEST timeout"}, 408)
         result = _pending_hw_test[mac].get("result")
+        if isinstance(result, dict) and result.get("refused"):
+            return JSONResponse({"error": f"HW_TEST refused by node: {result['refused']}"}, 409)
         return {"ok": True, "mac": mac, "test_results": result}
     finally:
         _pending_hw_test.pop(mac, None)
