@@ -6,15 +6,16 @@ import httpx
 from fastapi import APIRouter, Request, Body
 from fastapi.responses import JSONResponse
 
-from app.config import DEFAULT_CLOUD_URL, STATIC_DIR
+from app.config import DATA_DIR, DEFAULT_CLOUD_URL
 from app.utils import log
 
 router = APIRouter()
 
 # Persisted manufacturer session — so the Station (especially on the OPi kiosk, where the
 # long mfr key is painful to type) logs in ONCE and auto-restores on boot / when the network
-# returns. Trusted local device; stored 0600. Cleared only on explicit logout.
-SESSION_PATH = os.path.join(STATIC_DIR, "mfr_session.json")
+# returns. Stored 0600 in DATA_DIR — deliberately NOT under STATIC_DIR, which is mounted
+# at /static and therefore served over HTTP to anyone who can reach the port.
+SESSION_PATH = os.path.join(DATA_DIR, "mfr_session.json")
 
 
 def _s(r: Request):

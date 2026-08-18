@@ -6,7 +6,13 @@ STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
 TEMPLATE_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "templates")
 TEST_PACK_DIR = os.path.join(STATIC_DIR, "test_pack")
 FIRMWARE_DIR = os.path.join(STATIC_DIR, "firmware")
-DB_PATH = os.path.join(STATIC_DIR, "provision_log.db")
+# Runtime data lives OUTSIDE STATIC_DIR deliberately: app/__init__.py mounts STATIC_DIR
+# at /static via StaticFiles, so every file under it is downloadable over HTTP with no
+# authentication. The session file (manufacturer API key) and this DB (recovery keys)
+# were both being served that way — 0600 on disk does not help, the server reads them as
+# root and hands out the bytes. Never put a secret under STATIC_DIR.
+DATA_DIR = os.environ.get("LDPS_DATA_DIR", "/var/lib/ldps-station")
+DB_PATH = os.path.join(DATA_DIR, "provision_log.db")
 
 # Cloud target. Precedence: CLOUD_URL env → LDPS_STAGE profile → prod default — so
 # dev never silently provisions against production. LDPS_STAGE flips local / uat /

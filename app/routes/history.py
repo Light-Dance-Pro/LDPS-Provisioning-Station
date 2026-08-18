@@ -29,8 +29,15 @@ def list_history(request: Request,
                  status: str = Query(""),
                  search: str = Query("")):
     log = _log(request)
-    return {"logs": log.list(limit=limit, offset=offset, status=status, search=search,
-                             manufacturer_id=_mfr_id(request))}
+    rows = log.list(limit=limit, offset=offset, status=status, search=search,
+                    manufacturer_id=_mfr_id(request))
+    # Never serve the recovery key over the API. The History tab does not display it (the
+    # label preview gets it from the finalize response), so nothing in the UI regresses —
+    # but this endpoint was handing the ownership secret to any caller. Re-printing a
+    # label still works on the Station itself: print_label.py --uuid <uuid>.
+    for r in rows:
+        r.pop("recovery_key", None)
+    return {"logs": rows}
 
 
 @router.get("/stats")

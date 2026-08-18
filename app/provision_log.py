@@ -45,6 +45,23 @@ class ProvisionLog:
         if "manufacturer_id" not in cols:
             self._conn.execute("ALTER TABLE provision_logs ADD COLUMN manufacturer_id TEXT")
         self._conn.commit()
+        self.purge_recovery_keys()
+
+    # Recovery keys are the ownership re-claim secret. The cloud keeps them ENCRYPTED and
+    # hands the plaintext back exactly once; the Station kept it forever in the clear.
+    # Keep it only as long as a label re-print is plausible, then null the COLUMN — never
+    # delete the row, which would take the yield/QC history with it.
+    RECOVERY_KEY_RETENTION_DAYS = 7
+
+    def purge_recovery_keys(self, days: int = None) -> int:
+        days = self.RECOVERY_KEY_RETENTION_DAYS if days is None else days
+        cur = self._conn.execute(
+            "UPDATE provision_logs SET recovery_key = NULL "
+            "WHERE recovery_key IS NOT NULL AND timestamp < datetime('now', ?)",
+            (f"-{int(days)} days",),
+        )
+        self._conn.commit()
+        return cur.rowcount or 0
 
     def add(self, mac: str, uuid: Optional[str], product_type: str,
             firmware_ver: str, test_results: Optional[dict],

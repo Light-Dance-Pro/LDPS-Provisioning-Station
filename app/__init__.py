@@ -6,7 +6,6 @@ import time
 from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from starlette.middleware.cors import CORSMiddleware
 
 from app.config import STATIC_DIR, TEMPLATE_DIR, TEST_PACK_DIR
 from app.state import AppState
@@ -81,12 +80,16 @@ def _setup_espnow_handler(state: AppState, espnow) -> None:
 def create_app() -> FastAPI:
     app = FastAPI(title="LDPS Factory")
 
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    # No CORS middleware on purpose. The SPA is served from this same origin, so it never
+    # needed cross-origin access — and allow_origins=["*"] meant any page an operator
+    # happened to visit could drive the provisioning API through their browser.
+
+    # Operator auth over BOTH http and websocket scopes (app/auth.py explains why it is
+    # pure ASGI rather than BaseHTTPMiddleware). Loopback is exempt so the kiosk browser
+    # and the on-Pi helper scripts keep working; anything over the network must present
+    # the shared secret. Fails closed: a missing secret file raises here, at startup.
+    from app.auth import OperatorAuth, load_secret
+    app.add_middleware(OperatorAuth, secret=load_secret())
 
     # State
     state = AppState()
@@ -163,7 +166,7 @@ def create_app() -> FastAPI:
 
     @app.get("/")
     def index(request: Request):
-        return templates.TemplateResponse("index.html", {"request": request})
+        return templates.TemplateResponse(request, "index.html")
 
     @app.on_event("startup")
     async def startup():
