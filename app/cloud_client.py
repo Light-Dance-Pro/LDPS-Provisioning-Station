@@ -105,6 +105,27 @@ class CloudClient:
         except Exception as e:
             return {"ok": False, "status": 0, "error": str(e)}
 
+    async def dev_revoke(self, hardware_serial: str) -> dict:
+        """BENCH ONLY: revoke our node rows for `hardware_serial` so the same board can be
+        re-provisioned. The cloud double-gates this (ALLOW_DEV_REVOKE + a local database)
+        and returns 403 DEV_REVOKE_DISABLED anywhere else, so calling it is always safe.
+        Returns {ok, status, count, error}."""
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.post(f"{self.cloud_url}/provision/dev/revoke",
+                                      json={"hardware_serial": hardware_serial},
+                                      headers=self._headers())
+            body = {}
+            try:
+                body = r.json()
+            except Exception:
+                pass
+            return {"ok": r.status_code == 200, "status": r.status_code,
+                    "count": body.get("count", 0),
+                    "error": body.get("error", "") if r.status_code != 200 else ""}
+        except Exception as e:
+            return {"ok": False, "status": 0, "count": 0, "error": str(e)}
+
     async def defect(self, uuid: str, reason: str = "") -> bool:
         """Mark a reserved/provisioned node 'defected' (keeps row + quota for yield tracking)."""
         try:

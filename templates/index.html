@@ -269,7 +269,7 @@
             <div v-if="nodeReady.nodeBlocked" style="text-align:center;margin-top:10px;">
               <button class="btn btn-danger" :disabled="nodeClearBusy" @click="readyClearNode">
                 [[ nodeClearBusy ? 'Clearing…' : 'Clear node identity (re-provision)' ]]</button>
-              <div class="text-muted" style="font-size:11px;margin-top:4px;">Wipes uuid + genuineness from the node's NVS so this unit can be provisioned again. The old cloud record (if any) stays — handle it in admin.</div>
+              <div class="text-muted" style="font-size:11px;margin-top:4px;">Wipes uuid + genuineness from the node's NVS so this unit can be provisioned again. On a bench (local stage) the cloud record is revoked too; on uat/prod it stays — handle it in admin.</div>
             </div>
           </div>
           <div style="text-align:center;margin-top:18px;">

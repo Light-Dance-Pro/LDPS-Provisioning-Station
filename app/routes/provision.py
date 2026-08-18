@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import time
 import threading
@@ -10,6 +11,7 @@ from threading import Event
 from fastapi import APIRouter, Request, Body
 from fastapi.responses import JSONResponse
 
+from app.config import LDPS_STAGE_RESOLVED
 from app.utils import log
 
 router = APIRouter()
@@ -153,6 +155,15 @@ def _log_success(s, mac: str, uuid: str, product: str, firmware_ver: str,
         manufacturer_id=getattr(getattr(s, "cloud_client", None), "manufacturer_id", ""),
     )
     s.stats_provisioned += 1
+    # Box label: printed here because this is the ONLY point where the unit is
+    # committed AND the plaintext recovery key is still in hand (the cloud returns
+    # it once). Fire-and-forget — a paper jam must not fail an already-provisioned
+    # unit; on failure the log line carries the re-print command.
+    from app.config import DEFAULT_CLOUD_URL
+    from app.label_printer import print_async
+    print_async({"uuid": uuid, "mac": mac, "product_type": product,
+                 "firmware_ver": firmware_ver, "recovery_key": recovery_key,
+                 "timestamp": datetime.datetime.now().isoformat()}, DEFAULT_CLOUD_URL)
     if s.ws:
         s.ws.broadcast("stats", {"provisioned": s.stats_provisioned, "failed": s.stats_failed})
         s.ws.broadcast("provision", {"step": "done", "mac": mac, "uuid": uuid,
@@ -485,17 +496,41 @@ async def clear_node(request: Request, data: dict = Body(...)):
     """Un-provision the node over USB ('U') so it can be RE-provisioned WITHOUT a reflash
     (identity is write-once; re-mint needs a blank node). Clears uuid + genuineness + owner
     from NVS only — the SD (packs/logs) is untouched. Body: {port}."""
-    from app.node_serial import clear_identity
+    from app.node_serial import clear_identity, read_identity
     port = (data or {}).get("port")
     if not port:
         return JSONResponse({"error": "port required"}, 400)
+
+    # Read the serial BEFORE clearing — after the clear the node still reports its MAC,
+    # but reading first means a clear that half-succeeds can't leave us revoking blind.
+    hw_serial = ""
+    try:
+        hw_serial = (await asyncio.to_thread(read_identity, port)).get("mac", "").upper()
+    except Exception:
+        pass
+
     try:
         r = await asyncio.to_thread(clear_identity, port)
     except Exception as e:
         return JSONResponse({"error": f"USB clear error on {port}: {e}"}, 500)
     if not r.get("ok"):
         return JSONResponse({"error": r.get("detail", "clear failed")}, 500)
-    return {"ok": True, "detail": r["detail"]}
+
+    # Clearing the node is only HALF the reset: the cloud still holds the serial, so the
+    # next mint would fail with SERIAL_EXISTS. On a bench (local stage) also revoke the
+    # cloud row so "clear" means what the operator expects. The cloud double-gates this
+    # and 403s anywhere else, so uat/prod keep the anti-duplicate guard intact.
+    s = _s(request)
+    revoked = None
+    if LDPS_STAGE_RESOLVED == "local" and hw_serial and getattr(s, "cloud_client", None):
+        rev = await s.cloud_client.dev_revoke(hw_serial)
+        revoked = rev.get("count", 0) if rev.get("ok") else 0
+        if rev.get("ok"):
+            log(f"[Provision] dev-revoked {revoked} cloud row(s) for {hw_serial}")
+        elif rev.get("status") != 403:      # 403 = disabled by design, not an error
+            log(f"[Provision] dev revoke failed for {hw_serial}: {rev.get('error')}", "WARNING")
+
+    return {"ok": True, "detail": r["detail"], "mac": hw_serial, "cloud_revoked": revoked}
 
 
 @router.post("/detect-node")
