@@ -6,7 +6,7 @@ import httpx
 from fastapi import APIRouter, Request, Body
 from fastapi.responses import JSONResponse
 
-from app.config import DEFAULT_CLOUD_URL, STATIC_DIR
+from app.config import DEFAULT_CLOUD_URL, LDPS_STAGE_RESOLVED, STAGE_CLOUD_URLS, STATIC_DIR
 from app.utils import log
 
 router = APIRouter()
@@ -25,10 +25,10 @@ def _has_saved_session() -> bool:
     return os.path.exists(SESSION_PATH)
 
 
-def _save_session(api_key: str, cloud_url: str) -> None:
+def _save_session(api_key: str) -> None:
     try:
         with open(SESSION_PATH, "w") as f:
-            json.dump({"api_key": api_key, "cloud_url": cloud_url}, f)
+            json.dump({"api_key": api_key, "stage": LDPS_STAGE_RESOLVED}, f)
         os.chmod(SESSION_PATH, 0o600)
     except Exception as e:
         log(f"[Cloud] session save failed: {e}", "WARNING")
@@ -52,17 +52,17 @@ async def _cloud_reachable(url: str) -> bool:
         return False
 
 
-async def _do_login(state, api_key: str, cloud_url: str) -> dict:
+async def _do_login(state, api_key: str) -> dict:
     """Shared login path: validate the key, attach the client, persist the session."""
     from app.cloud_client import CloudClient
-    client = CloudClient(cloud_url)
+    client = CloudClient(DEFAULT_CLOUD_URL)
     result = await client.login(api_key)
     if result.get("ok"):
         state.cloud_client = client
-        state.cloud_url = cloud_url
+        state.cloud_url = DEFAULT_CLOUD_URL
         state.cloud_token = api_key
         state.cloud_email = result.get("name", "Manufacturer")
-        _save_session(api_key, cloud_url)
+        _save_session(api_key)
     return result
 
 
@@ -77,10 +77,9 @@ async def restore_session(state) -> None:
     except Exception:
         return
     api_key = sess.get("api_key")
-    cloud_url = sess.get("cloud_url") or DEFAULT_CLOUD_URL
     if not api_key:
         return
-    result = await _do_login(state, api_key, cloud_url)
+    result = await _do_login(state, api_key)
     log("[Cloud] session restore: " + ("ok " + str(result.get("name")) if result.get("ok")
         else "deferred (" + str(result.get("error")) + ")"))
 
@@ -90,12 +89,10 @@ async def cloud_login(request: Request, data: dict = Body(...)):
     """Login with manufacturer API key (not email/password)."""
     s = _s(request)
     api_key = data.get("api_key", "")
-    cloud_url = data.get("cloud_url", DEFAULT_CLOUD_URL)
-
     if not api_key:
         return JSONResponse({"error": "api_key required"}, 400)
 
-    result = await _do_login(s, api_key, cloud_url)
+    result = await _do_login(s, api_key)
     if result.get("ok"):
         if s.ws:
             s.ws.broadcast("cloud", {
@@ -119,8 +116,7 @@ async def cloud_relogin(request: Request):
             sess = json.load(f)
     except Exception:
         return JSONResponse({"error": "saved session unreadable"}, 500)
-    result = await _do_login(s, sess.get("api_key", ""),
-                             sess.get("cloud_url") or DEFAULT_CLOUD_URL)
+    result = await _do_login(s, sess.get("api_key", ""))
     if result.get("ok"):
         if s.ws:
             s.ws.broadcast("cloud", {"connected": True, "name": result.get("name", "")})
@@ -149,6 +145,8 @@ async def cloud_status(request: Request):
         "connected": connected,
         "reachable": await _cloud_reachable(url),
         "name": s.cloud_client.manufacturer_name if connected else "",
+        "stage": LDPS_STAGE_RESOLVED,
+        "stage_choices": list(STAGE_CLOUD_URLS),
         "cloud_url": url,
         "has_saved_session": _has_saved_session(),
     }

@@ -53,12 +53,13 @@ tools/  run_tests.py · generate_test_pack.py
 ## Dev
 
 ```bash
-# Local: point at the local cloud + run
-CLOUD_URL=http://localhost:3737 PORT=9000 python3 main.py
+# Local: use the managed Local Cloud profile
+LDPS_STAGE=local PORT=9000 python3 main.py
 ```
-- `LDPS_STAGE` is required unless `CLOUD_URL` is explicit; `uat` resolves to
-  `api-uat.lightdancepro.com` and `prod` to `api.lightdancepro.com`. There is no silent Production
-  default.
+- `LDPS_STAGE` is required and has exactly three values: `local`, `uat`, and `prod`.
+  UAT resolves to `api-uat.lightdancepro.com` and Production to
+  `api.lightdancepro.com`; there is no silent Production or arbitrary URL target.
+  `LOCAL_CLOUD_URL` may change only the Local workstation address.
 - Manufacturer API key auth: `X-Manufacturer-Key` (cloud `/provision/login`); separate from
   Studio JWT / Hub device-token. Decision authority:
   [`LDPS-Hardware ADR-004`](../docs/adr/ADR-004-MANUFACTURER-API-KEY-AUTH.md).
