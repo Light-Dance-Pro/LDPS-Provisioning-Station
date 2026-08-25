@@ -15,8 +15,8 @@ DB_PATH = os.path.join(STATIC_DIR, "provision_log.db")
 STAGE_CLOUD_URLS = {
     "local-mock": "http://localhost:8001",
     "local": "http://localhost:3737",
-    "uat": "https://ldpstudioc-uat.zeabur.app",
-    "prod": "https://ldpstudioc.zeabur.app",
+    "uat": "https://api-uat.lightdancepro.com",
+    "prod": "https://api.lightdancepro.com",
 }
 _STAGE = os.environ.get("LDPS_STAGE", "").strip().lower()
 _ENV_CLOUD_URL = os.environ.get("CLOUD_URL", "").strip()
@@ -43,7 +43,10 @@ def _derive_stage(url: str) -> str:
         return "local"
     if "uat" in u:
         return "uat"
+    if "api.lightdancepro.com" in u:
+        return "prod"
     if "zeabur" in u or "ldpstudioc" in u:
+        # Legacy manual override during the rollback window only.
         return "prod"
     return "unknown"
 

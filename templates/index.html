@@ -580,6 +580,7 @@ Vue.createApp({
       if (/localhost|127\.0\.0\.1|0\.0\.0\.0|192\.168\.|10\.\d|172\.(1[6-9]|2\d|3[01])\./.test(u))
         return { label: 'LOCAL', color: '#60a5fa', bg: 'rgba(96,165,250,0.16)' };
       if (/uat/.test(u)) return { label: 'UAT', color: '#fb923c', bg: 'rgba(251,146,60,0.16)' };
+      if (/api\.lightdancepro\.com/.test(u)) return { label: 'PROD', color: '#f87171', bg: 'rgba(248,113,113,0.18)' };
       if (/zeabur|ldpstudioc/.test(u)) return { label: 'PROD', color: '#f87171', bg: 'rgba(248,113,113,0.18)' };
       return { label: '', color: '', bg: '' };
     },

@@ -3,7 +3,7 @@
 The factory production-line tool. One app, **multiple roles** — it provisions and
 QC-tests devices on the assembly line, talking to the Cloud with a **manufacturer
 API key** (never Supabase/Studio auth). Separate git repo
-(`xavier-detrouble/LDPS-Provisioning-Station`); direct-push to `main` with records.
+(`Light-Dance-Pro/LDPS-Provisioning-Station`); it has no automatic deployment.
 
 > Language: English-primary; supplementary Mandarin (Traditional) in marked bullets only, never
 > Cantonese, never mid-paragraph.
@@ -56,18 +56,21 @@ tools/  run_tests.py · generate_test_pack.py
 # Local: point at the local cloud + run
 CLOUD_URL=http://localhost:3737 PORT=9000 python3 main.py
 ```
-- `CLOUD_URL` env (prod default is the Zeabur cloud); set it for local/testbed.
+- `LDPS_STAGE` is required unless `CLOUD_URL` is explicit; `uat` resolves to
+  `api-uat.lightdancepro.com` and `prod` to `api.lightdancepro.com`. There is no silent Production
+  default.
 - Manufacturer API key auth: `X-Manufacturer-Key` (cloud `/provision/login`); separate from
-  Studio JWT / Hub device-token. See cloud `docs/adr/ADR-MANUFACTURER-API-KEY-AUTH.md`.
+  Studio JWT / Hub device-token. Decision authority:
+  [`LDPS-Hardware ADR-004`](../docs/adr/ADR-004-MANUFACTURER-API-KEY-AUTH.md).
 - Verify cloud comms without HW via FastAPI `TestClient` (cloud_client makes real cloud calls).
 
 ## Authority docs
 
 - [`../docs/architecture/provisioning/README.md`](../docs/architecture/provisioning/README.md) — **cross-repo MAP** (which repo
   implements which part of the provisioning design; read first).
-- `LDPS-Hardware/docs/provisioning/PROVISION_IDENTITY_OWNERSHIP_DESIGN.md` — single authority
+- `LDPS-Hardware/docs/architecture/provisioning/PROVISION_IDENTITY_OWNERSHIP_DESIGN.md` — single authority
   (node identity/ownership/QC; §9 = build log).
-- `LDPS-Hardware/docs/provisioning/HUB_IDENTITY_DESIGN.md` — hub flow B (§5), factory-access
+- `LDPS-Hardware/docs/architecture/provisioning/HUB_IDENTITY_DESIGN.md` — hub flow B (§5), factory-access
   channel (§6.1), the Station/Hub change register (§8.3/§8.4), execution log (§13).
 
 ## Status (2026-07-02)
