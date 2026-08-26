@@ -17,7 +17,8 @@ API key** (never Supabase/Studio auth). Separate git repo
 |---|---|---|
 | **Edge-Node** (ESP32-S3) | flash firmware (`flasher.py`, esptool + SHA-256 manifest) **and** provision: cloud `request-uuid` (UUID + Ed25519 genuineness sig + key_id + **recovery key**) → write identity over USB (`P <uuid> <sig> <key_id>`, write-once) → cloud `confirm` → RF/playback QC | **USB serial** (identity is USB-only, never RF) |
 | **Control-Hub** (Orange Pi) | functional-test + register + write the SD binding (**flow B**, HUB_IDENTITY §5): read cpuid → cloud `/provision/hub` → write `hub_boot_identity.json`+`signing_keys.json` to the SD → QC → `/provision/hub/confirm`. The Station does **not** flash the OPi | the §6.1 **provisioning channel** (direct-local USB-gadget/eth HTTP — step-3, real-HW) |
-| **Dongle** (ESP32-S3) | the Station does **not** flash it directly — it commands the **OPi (hub)** to flash the dongle on the OPi's USB | via the hub |
+| **Control Hub Dongle** (ESP32-S3) | the Station does **not** flash it directly — it commands the **OPi (hub)** to flash the dongle on the OPi's USB | via the hub |
+| **Desktop Hub Dongle** (ESP32-S3 + SX1262) | CLI-only MVP: require USB/SX1262/ESP-NOW readiness → Cloud reserve/sign → verify signature locally → write the stage-independent identity once → exact read-back → Cloud confirm. The Desktop Hub app itself is not provisioned | **direct USB serial** |
 
 ## Security model (factory access)
 
@@ -37,7 +38,9 @@ FastAPI (`main.py` → `create_app`, port `9000`) + a Vue SPA single template
 ```
 app/
   cloud_client.py   manufacturer-key cloud client: login, get_quota, request_uuid/confirm,
-                    report_test_fail (node) · provision_hub/confirm_hub/rebind_hub (hub)
+                    report_test_fail (node) · provision_hub/confirm_hub/rebind_hub (hub) ·
+                    provision_desktop_dongle/confirm_desktop_dongle
+  desktop_dongle_serial.py direct-USB identity transport + offline Ed25519 verification
   routes/
     cloud.py        /api/cloud/login|status|quota|logout
     provision.py    node: discover, identify, hw-test, finalize (USB provision), playback-test,
@@ -47,7 +50,7 @@ app/
   flasher.py · node_serial.py · espnow.py · dongle.py   (HW transports)
   provision_log.py  local SQLite yield log (success/failed)
   state.py · ws_manager.py · config.py · utils.py
-tools/  run_tests.py · generate_test_pack.py
+tools/  run_tests.py · generate_test_pack.py · provision_desktop_dongle.py
 ```
 
 ## Dev
@@ -55,6 +58,9 @@ tools/  run_tests.py · generate_test_pack.py
 ```bash
 # Local: use the managed Local Cloud profile
 LDPS_STAGE=local PORT=9000 python3 main.py
+
+# Desktop Hub Dongle CLI (approved firmware must already be installed)
+LDPS_STAGE=local python3 tools/provision_desktop_dongle.py --port /dev/cu.usbmodem101
 ```
 - `LDPS_STAGE` is required and has exactly three values: `local`, `uat`, and `prod`.
   UAT resolves to `api-uat.lightdancepro.com` and Production to
@@ -64,6 +70,9 @@ LDPS_STAGE=local PORT=9000 python3 main.py
   Studio JWT / Hub device-token. Decision authority:
   [`LDPS-Hardware ADR-004`](../docs/adr/ADR-004-MANUFACTURER-API-KEY-AUTH.md).
 - Verify cloud comms without HW via FastAPI `TestClient` (cloud_client makes real cloud calls).
+- The Desktop Hub Dongle CLI is intentionally not exposed in the Station UI yet. `--resume`
+  verifies an already-written identity against the selected Cloud public keys and retries only
+  the Cloud commit; there is no normal identity-clear command.
 
 ## Authority docs
 

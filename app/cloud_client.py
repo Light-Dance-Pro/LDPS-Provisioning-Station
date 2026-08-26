@@ -187,6 +187,79 @@ class CloudClient:
         except Exception as e:
             return {"ok": False, "status": 0, "error": str(e)}
 
+    # ── Desktop Hub Dongle provisioning — direct USB ESP32-S3 identity write.
+
+    async def provision_desktop_dongle(
+        self,
+        hardware_fingerprint: str,
+        product: str,
+        test_results: dict = None,
+        firmware_ver: str = "",
+        provision_batch: str = "",
+    ) -> dict:
+        """Reserve and sign a Desktop Hub Dongle identity."""
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.post(
+                    f"{self.cloud_url}/provision/desktop-dongle",
+                    json={
+                        "hardware_fingerprint": hardware_fingerprint,
+                        "product": product,
+                        "test_results": test_results,
+                        "firmware_ver": firmware_ver or None,
+                        "provision_batch": provision_batch or None,
+                    },
+                    headers=self._headers(),
+                )
+            try:
+                data = r.json()
+            except Exception:
+                data = {}
+            if r.status_code == 200 and data.get("ok"):
+                return data
+            log(f"[Cloud] provision-desktop-dongle failed: {r.status_code} {data}", "WARNING")
+            return {
+                "ok": False,
+                "status": r.status_code,
+                "error": data.get("error", f"HTTP {r.status_code}"),
+                "code": data.get("code"),
+            }
+        except Exception as e:
+            log(f"[Cloud] provision-desktop-dongle error: {e}", "ERROR")
+            return {"ok": False, "status": 0, "error": str(e)}
+
+    async def confirm_desktop_dongle(self, hub_uuid: str, success: bool = True) -> dict:
+        """Commit an exact USB readback, or release a deterministically failed write."""
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.post(
+                    f"{self.cloud_url}/provision/desktop-dongle/confirm",
+                    json={"hub_uuid": hub_uuid, "success": success},
+                    headers=self._headers(),
+                )
+            try:
+                data = r.json()
+            except Exception:
+                data = {}
+            return {
+                "ok": r.status_code == 200 and bool(data.get("ok")),
+                "status": r.status_code,
+                "error": "" if r.status_code == 200 else data.get("error", r.text[:200]),
+            }
+        except Exception as e:
+            return {"ok": False, "status": 0, "error": str(e)}
+
+    async def get_signing_keys(self) -> list:
+        """Fetch public factory keys; these are safe to cache and use offline."""
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.get(f"{self.cloud_url}/provision/signing-keys")
+            if r.status_code != 200:
+                return []
+            return (r.json() or {}).get("keys", [])
+        except Exception:
+            return []
+
     async def defect_hub(self, hub_uuid: str, reason: str = "") -> bool:
         """Mark a reserved/provisioned hub 'defected' (keeps row + quota for yield tracking)."""
         try:
