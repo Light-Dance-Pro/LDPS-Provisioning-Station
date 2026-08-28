@@ -157,10 +157,15 @@ def write_identity(port: str, identity: dict, attempts: int = 4) -> dict:
         "bad_key_id",
         "bad_signature",
     }
+    # A valid identity response is authoritative for this device. If it does not
+    # match the reservation after every retry, the reserved identity was not
+    # written and can be released. An unreadable response remains ambiguous and
+    # must be retained for --resume rather than risking a second identity.
+    readback_proves_not_written = bool(actual.get("ok"))
     return {
         "ok": False,
         "code": code,
-        "safe_to_release": deterministic_rejection,
+        "safe_to_release": deterministic_rejection or readback_proves_not_written,
         "identity": actual,
         "detail": ack or raw[-200:].strip(),
     }

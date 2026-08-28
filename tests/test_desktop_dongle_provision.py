@@ -4,7 +4,7 @@ import os
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -89,6 +89,106 @@ class DesktopDongleProvisionTest(unittest.TestCase):
             "identity_signature": "ab" * 64,
         })
         self.assertTrue(result["ok"])
+
+    @patch("app.desktop_dongle_serial.time.sleep")
+    @patch("app.desktop_dongle_serial.read_identity")
+    @patch("app.desktop_dongle_serial._txn")
+    def test_lost_write_ack_releases_when_readback_proves_identity_was_not_written(
+        self, txn, read, _sleep
+    ):
+        txn.return_value = ""
+        read.return_value = {
+            "ok": True,
+            "provisioned": False,
+            "identity_version": 0,
+            "hub_uuid": "",
+            "hardware_fingerprint": "AABBCCDDEEFF",
+            "key_id": "",
+            "signature": "",
+        }
+        result = write_identity("test-port", {
+            "hub_uuid": "11111111-2222-4333-8444-555555555555",
+            "hardware_fingerprint": "AABBCCDDEEFF",
+            "key_id": "factory-v1",
+            "identity_signature": "ab" * 64,
+        })
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["safe_to_release"])
+
+    @patch("app.desktop_dongle_serial.time.sleep")
+    @patch("app.desktop_dongle_serial.read_identity")
+    @patch("app.desktop_dongle_serial._txn")
+    def test_lost_write_ack_retains_reservation_when_readback_is_unavailable(
+        self, txn, read, _sleep
+    ):
+        txn.return_value = ""
+        read.return_value = {
+            "ok": False,
+            "provisioned": False,
+            "error": "no_response",
+        }
+        result = write_identity("test-port", {
+            "hub_uuid": "11111111-2222-4333-8444-555555555555",
+            "hardware_fingerprint": "AABBCCDDEEFF",
+            "key_id": "factory-v1",
+            "identity_signature": "ab" * 64,
+        })
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["safe_to_release"])
+
+    @patch("tools.provision_desktop_dongle.write_identity")
+    @patch("tools.provision_desktop_dongle.verify_identity_signature", return_value=False)
+    @patch("tools.provision_desktop_dongle.manufacturer_key", return_value="local-test-key")
+    @patch("tools.provision_desktop_dongle.read_identity")
+    @patch("tools.provision_desktop_dongle.read_status")
+    @patch("tools.provision_desktop_dongle.CloudClient")
+    def test_invalid_cloud_signature_releases_reservation_before_usb_write(
+        self, cloud_cls, read_status, read_identity, _manufacturer_key,
+        _verify_signature, write_identity_mock,
+    ):
+        read_status.return_value = {
+            "ok": True,
+            "hardware_fingerprint": "AABBCCDDEEFF",
+            "sx1262": "ok",
+            "espnow": "ok",
+            "firmware_ver": "1.2.16",
+        }
+        read_identity.return_value = {
+            "ok": True,
+            "provisioned": False,
+            "hardware_fingerprint": "AABBCCDDEEFF",
+        }
+        cloud = Mock()
+        cloud.login = AsyncMock(return_value={"ok": True})
+        cloud.provision_desktop_dongle = AsyncMock(return_value={
+            "ok": True,
+            "hub_uuid": "11111111-2222-4333-8444-555555555555",
+            "hardware_fingerprint": "AABBCCDDEEFF",
+            "identity_signature": "ab" * 64,
+            "key_id": "factory-v1",
+            "signing_keys": [],
+        })
+        cloud.confirm_desktop_dongle = AsyncMock(return_value={
+            "ok": True,
+            "status": 200,
+            "error": "",
+        })
+        cloud_cls.return_value = cloud
+        args = argparse.Namespace(
+            port="test-port",
+            product="Desktop Hub Dongle",
+            batch="",
+            resume=False,
+        )
+
+        with patch("builtins.print"):
+            result = asyncio.run(provision_cli.run(args))
+
+        self.assertEqual(result, 4)
+        cloud.confirm_desktop_dongle.assert_awaited_once_with(
+            "11111111-2222-4333-8444-555555555555", success=False
+        )
+        write_identity_mock.assert_not_called()
 
     @patch("tools.provision_desktop_dongle.read_status")
     def test_cli_fails_before_reservation_when_espnow_qc_fails(self, read_status):

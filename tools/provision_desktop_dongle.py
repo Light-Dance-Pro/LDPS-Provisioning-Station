@@ -118,7 +118,15 @@ async def run(args: argparse.Namespace) -> int:
         response["key_id"],
         response.get("signing_keys", []),
     ):
-        print("ERROR: Cloud returned an identity signature that failed local verification")
+        released = await cloud.confirm_desktop_dongle(response["hub_uuid"], success=False)
+        release_note = (
+            "reservation released" if released.get("ok")
+            else "reservation release failed"
+        )
+        print(
+            "ERROR: Cloud returned an identity signature that failed local verification; "
+            f"{release_note}"
+        )
         return 4
 
     written = write_identity(args.port, response)
