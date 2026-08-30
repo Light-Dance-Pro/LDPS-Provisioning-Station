@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 import time
+import uuid
 
 import serial
 from cryptography.exceptions import InvalidSignature
@@ -20,9 +21,13 @@ def normalize_fingerprint(value: str) -> str:
 
 def identity_message(hub_uuid: str, hardware_fingerprint: str) -> bytes:
     fingerprint = normalize_fingerprint(hardware_fingerprint)
-    if not re.fullmatch(r"[0-9a-fA-F-]{36}", str(hub_uuid or "")) or not fingerprint:
+    try:
+        canonical_uuid = str(uuid.UUID(str(hub_uuid or "")))
+    except (ValueError, AttributeError):
+        canonical_uuid = ""
+    if not canonical_uuid or not fingerprint:
         raise ValueError("invalid Desktop Hub Dongle identity")
-    return f"{IDENTITY_DOMAIN}:v{IDENTITY_VERSION}:{hub_uuid}:{fingerprint}".encode()
+    return f"{IDENTITY_DOMAIN}:v{IDENTITY_VERSION}:{canonical_uuid}:{fingerprint}".encode()
 
 
 def verify_identity_signature(
@@ -100,15 +105,22 @@ def read_identity(port: str) -> dict:
     payload = _last_payload(raw, "IDENTITY,")
     fields = _fields(payload)
     provisioned = fields.get("provisioned") == "1"
+    try:
+        identity_version = int(fields.get("iv", "0") or 0)
+    except (TypeError, ValueError):
+        identity_version = None
+    error = fields.get("error", "")
+    if identity_version is None and not error:
+        error = "invalid_identity_version"
     return {
-        "ok": bool(payload) and not fields.get("error"),
+        "ok": bool(payload) and not error,
         "provisioned": provisioned,
-        "identity_version": int(fields.get("iv", "0") or 0),
+        "identity_version": identity_version,
         "hub_uuid": fields.get("uuid", ""),
         "hardware_fingerprint": normalize_fingerprint(fields.get("fingerprint", "")),
         "key_id": fields.get("kid", ""),
         "signature": fields.get("sig", "").lower(),
-        "error": fields.get("error", ""),
+        "error": error,
         "raw": raw,
     }
 

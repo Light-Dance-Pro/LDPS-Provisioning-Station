@@ -56,6 +56,10 @@ class DesktopDongleProvisionTest(unittest.TestCase):
             [{"key_id": "factory-v1", "public_key": public_hex, "algo": "ed25519"}],
         ))
 
+    def test_identity_message_rejects_uuid_shaped_garbage(self):
+        with self.assertRaises(ValueError):
+            identity_message("-" * 36, "AABBCCDDEEFF")
+
     @patch("app.desktop_dongle_serial._txn")
     def test_identity_response_parser(self, txn):
         txn.return_value = (
@@ -68,6 +72,17 @@ class DesktopDongleProvisionTest(unittest.TestCase):
         self.assertTrue(identity["ok"])
         self.assertTrue(identity["provisioned"])
         self.assertEqual(identity["hardware_fingerprint"], "AABBCCDDEEFF")
+
+    @patch("app.desktop_dongle_serial._txn")
+    def test_malformed_identity_version_fails_closed_without_crashing(self, txn):
+        txn.return_value = (
+            "dg:IDENTITY,provisioned=1,iv=corrupt,"
+            "uuid=11111111-2222-4333-8444-555555555555,"
+            "fingerprint=AABBCCDDEEFF,kid=factory-v1,sig=" + "ab" * 64 + "\n"
+        )
+        identity = read_identity("test-port")
+        self.assertFalse(identity["ok"])
+        self.assertEqual(identity["error"], "invalid_identity_version")
 
     @patch("app.desktop_dongle_serial.time.sleep")
     @patch("app.desktop_dongle_serial.read_identity")
