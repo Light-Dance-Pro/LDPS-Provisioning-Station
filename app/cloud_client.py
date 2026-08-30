@@ -55,6 +55,34 @@ class CloudClient:
         result = await self.login(self.api_key)
         return result.get("quotas", self.quotas)
 
+    async def resolve_factory_firmware(self, device: str) -> dict:
+        """Resolve an allowlisted dongle factory image through release authority."""
+        if device not in {"console-dongle", "desktop-dongle"}:
+            return {"ok": False, "error": "unknown factory firmware device"}
+        if not self.api_key:
+            return {"ok": False, "error": "manufacturer login required", "status": 401}
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                response = await client.get(
+                    f"{self.cloud_url}/provision/firmware/{device}",
+                    headers=self._headers(),
+                )
+            try:
+                payload = response.json()
+            except Exception:
+                payload = {}
+            if response.status_code == 200 and payload.get("ok") is True:
+                return payload
+            return {
+                "ok": False,
+                "status": response.status_code,
+                "reason": payload.get("reason"),
+                "error": payload.get("error") or payload.get("reason")
+                         or f"HTTP {response.status_code}",
+            }
+        except Exception as exc:
+            return {"ok": False, "status": 0, "error": str(exc)}
+
     async def request_uuid(self, hardware_serial: str, product: str,
                            test_results: dict = None, firmware_ver: str = "") -> dict | None:
         """Mint a node UUID. product (the catalog product key) is REQUIRED (cloud QC gate). Returns

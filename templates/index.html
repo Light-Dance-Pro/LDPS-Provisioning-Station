@@ -917,7 +917,7 @@ Vue.createApp({
         ['ok', 'failed'], 180000);
       if (st === null) throw new Error('Dongle flash outcome unknown after 3min — check /tmp/dongle_flash.log on the hub.');
       if (st === 'failed') throw new Error('Dongle flash FAILED (esptool rc≠0) — see /tmp/dongle_flash.log on the hub. Check the dongle is seated on ' + 'its USB.');
-      this._setHubPhase('dongle', 'done', (r.data && r.data.version) ? ('RF Bridge v' + r.data.version + ' · flashed') : 'flashed');
+      this._setHubPhase('dongle', 'done', (r.data && r.data.version) ? ('Console Hub Dongle v' + r.data.version + ' · flashed') : 'flashed');
     },
     async _hubPhaseSign() {
       const product = this._hubProductKey();

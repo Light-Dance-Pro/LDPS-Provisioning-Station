@@ -200,15 +200,12 @@ async def hub_write_identity(data: dict = Body(...)):
 
 @router.post("/flash-dongle")
 async def hub_flash_dongle(request: Request):
-    """Fetch the latest dongle firmware from the cloud registry (version-check → cache; download
-    only if newer) and push it to the hub over §6.1; the hub flashes the dongle on its USB. The
-    dongle stays offline (the line isn't interrupted by a per-unit download). Product 'RF Bridge'."""
+    """Resolve the canonical Console Hub Dongle factory image and push it to the Hub."""
     s = request.app.state.app_state
-    cloud_url = getattr(s, "cloud_url", "") or ""
-    if not cloud_url:
+    if not _need_cloud(s):
         return JSONResponse({"error": "Not logged in to Cloud"}, 401)
-    from app.firmware_cache import get_latest
-    fw = await get_latest(cloud_url, "RF Bridge")
+    from app.firmware_cache import get_canonical_factory
+    fw = await get_canonical_factory(s.cloud_client, "console-dongle")
     if not fw.get("ok"):
         return JSONResponse({"error": f"dongle firmware: {fw.get('error')}"}, 502)
     try:
