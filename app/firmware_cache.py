@@ -116,10 +116,6 @@ _FACTORY_CONTRACTS = {
         "target": "console-hub-dongle-esp32s3-v1",
         "profile": "esp32s3-console-dongle-v1",
     },
-    "desktop-dongle": {
-        "target": "desktop-hub-dongle-esp32s3-v1",
-        "profile": "esp32s3-desktop-dongle-v1",
-    },
 }
 
 

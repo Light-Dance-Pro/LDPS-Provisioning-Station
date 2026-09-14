@@ -6,7 +6,13 @@ import httpx
 from fastapi import APIRouter, Request, Body
 from fastapi.responses import JSONResponse
 
-from app.config import DEFAULT_CLOUD_URL, LDPS_STAGE_RESOLVED, STAGE_CLOUD_URLS, STATIC_DIR
+from app.config import (
+    DEFAULT_CLOUD_URL,
+    IDENTITY_MINTING_ALLOWED,
+    LDPS_STAGE_RESOLVED,
+    STAGE_CLOUD_URLS,
+    STATIC_DIR,
+)
 from app.utils import log
 
 router = APIRouter()
@@ -146,6 +152,7 @@ async def cloud_status(request: Request):
         "reachable": await _cloud_reachable(url),
         "name": s.cloud_client.manufacturer_name if connected else "",
         "stage": LDPS_STAGE_RESOLVED,
+        "identity_minting_allowed": IDENTITY_MINTING_ALLOWED,
         "stage_choices": list(STAGE_CLOUD_URLS),
         "cloud_url": url,
         "has_saved_session": _has_saved_session(),

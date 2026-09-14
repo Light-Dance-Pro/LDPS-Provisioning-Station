@@ -57,7 +57,7 @@ class CloudClient:
 
     async def resolve_factory_firmware(self, device: str) -> dict:
         """Resolve an allowlisted dongle factory image through release authority."""
-        if device not in {"console-dongle", "desktop-dongle"}:
+        if device != "console-dongle":
             return {"ok": False, "error": "unknown factory firmware device"}
         if not self.api_key:
             return {"ok": False, "error": "manufacturer login required", "status": 401}
@@ -88,10 +88,11 @@ class CloudClient:
         """Mint a node UUID. product (the catalog product key) is REQUIRED (cloud QC gate). Returns
         {uuid, signature, key_id, recovery_key} — signature is the cloud's Ed25519
         genuineness sig over the UUID, written to the node over USB and verified by
-        Hubs; recovery_key is the per-node re-claim key (returned ONCE, plaintext) the
-        operator prints on the box (§3.4) — never written to the node, stored encrypted
-        in the cloud. Returns None on failure (signature/key_id may be None if cloud
-        signing is not configured; the UUID is still minted)."""
+        Hubs; recovery_key is the per-node re-claim key (plaintext only in the active
+        factory response; idempotent retries return the same key) that the operator
+        prints on the box (§3.4) — never written to the node and stored encrypted in
+        Cloud. Returns None on failure. Genuineness signing is mandatory: the
+        Cloud must not reserve a production identity without signature + key_id."""
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 r = await client.post(f"{self.cloud_url}/provision/request-uuid",
@@ -117,7 +118,7 @@ class CloudClient:
     async def confirm(self, uuid: str, success: bool = True) -> dict:
         """COMMIT (identity written) or RELEASE (write failed → free quota).
         Returns {ok, status, error} — status 0 = network error (retryable);
-        4xx = terminal (e.g. 404 reservation reaped/unknown, 409 wrong lifecycle)."""
+        4xx = terminal (e.g. 404 missing record, 409 wrong lifecycle)."""
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 r = await client.post(f"{self.cloud_url}/provision/confirm",
@@ -199,7 +200,7 @@ class CloudClient:
     async def confirm_hub(self, hub_uuid: str, success: bool = True) -> dict:
         """COMMIT (SD binding written) or RELEASE (write failed → frees the quota).
         Returns {ok, status, error} — status 0 = network error (retryable);
-        4xx = terminal (404 reservation reaped/unknown, 409 wrong lifecycle)."""
+        4xx = terminal (404 missing record, 409 wrong lifecycle)."""
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 r = await client.post(f"{self.cloud_url}/provision/hub/confirm",
@@ -212,68 +213,6 @@ class CloudClient:
                 except Exception:
                     err = r.text[:200]
             return {"ok": r.status_code == 200, "status": r.status_code, "error": err}
-        except Exception as e:
-            return {"ok": False, "status": 0, "error": str(e)}
-
-    # ── Desktop Hub Dongle provisioning — direct USB ESP32-S3 identity write.
-
-    async def provision_desktop_dongle(
-        self,
-        hardware_fingerprint: str,
-        product: str,
-        test_results: dict = None,
-        firmware_ver: str = "",
-        provision_batch: str = "",
-    ) -> dict:
-        """Reserve and sign a Desktop Hub Dongle identity."""
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                r = await client.post(
-                    f"{self.cloud_url}/provision/desktop-dongle",
-                    json={
-                        "hardware_fingerprint": hardware_fingerprint,
-                        "product": product,
-                        "test_results": test_results,
-                        "firmware_ver": firmware_ver or None,
-                        "provision_batch": provision_batch or None,
-                    },
-                    headers=self._headers(),
-                )
-            try:
-                data = r.json()
-            except Exception:
-                data = {}
-            if r.status_code == 200 and data.get("ok"):
-                return data
-            log(f"[Cloud] provision-desktop-dongle failed: {r.status_code} {data}", "WARNING")
-            return {
-                "ok": False,
-                "status": r.status_code,
-                "error": data.get("error", f"HTTP {r.status_code}"),
-                "code": data.get("code"),
-            }
-        except Exception as e:
-            log(f"[Cloud] provision-desktop-dongle error: {e}", "ERROR")
-            return {"ok": False, "status": 0, "error": str(e)}
-
-    async def confirm_desktop_dongle(self, hub_uuid: str, success: bool = True) -> dict:
-        """Commit an exact USB readback, or release a deterministically failed write."""
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                r = await client.post(
-                    f"{self.cloud_url}/provision/desktop-dongle/confirm",
-                    json={"hub_uuid": hub_uuid, "success": success},
-                    headers=self._headers(),
-                )
-            try:
-                data = r.json()
-            except Exception:
-                data = {}
-            return {
-                "ok": r.status_code == 200 and bool(data.get("ok")),
-                "status": r.status_code,
-                "error": "" if r.status_code == 200 else data.get("error", r.text[:200]),
-            }
         except Exception as e:
             return {"ok": False, "status": 0, "error": str(e)}
 

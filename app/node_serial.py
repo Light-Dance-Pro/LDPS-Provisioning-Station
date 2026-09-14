@@ -13,10 +13,26 @@ import re
 import time
 
 import serial  # pyserial (in requirements.txt)
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from app.utils import log
 
 BAUD = 115200
+
+
+def verify_node_identity_signature(uuid: str, signature: str, key_id: str,
+                                   signing_keys: list) -> bool:
+    """Verify the Cloud-minted Node identity before commit/resume."""
+    key = next((item for item in signing_keys or [] if item.get("key_id") == key_id), None)
+    if not key or key.get("algo", "ed25519") != "ed25519":
+        return False
+    try:
+        public_key = Ed25519PublicKey.from_public_bytes(bytes.fromhex(key["public_key"]))
+        public_key.verify(bytes.fromhex(signature), uuid.encode("utf-8"))
+        return True
+    except (InvalidSignature, KeyError, TypeError, ValueError):
+        return False
 
 
 def _open(port: str, retries: int = 12, delay: float = 0.8) -> "serial.Serial":
@@ -94,22 +110,88 @@ def clear_identity(port: str) -> dict:
     return {"ok": False, "detail": "no clear ack: " + resp[-160:].strip()}
 
 
-def _read_back_matches(port: str, uuid: str, sig: str, key_id: str,
+def _read_back_matches(port: str, expected_mac: str, uuid: str, sig: str, key_id: str,
                        attempts: int = 5) -> dict:
-    """Re-read 'i' until the node reports exactly {uuid, sig, key_id}. RETRIED: the very
+    """Re-read 'i' until the same node reports exactly {uuid, sig, key_id}. RETRIED: the very
     first read-back after 'P' sometimes comes back EMPTY (port close/reopen races the
     node's USB-CDC), which falsely failed a write that actually stuck."""
     ident = {}
     for _ in range(max(1, attempts)):
         ident = read_identity(port)
-        if (ident.get("uuid") == uuid and ident.get("sig") == sig.lower()
+        if ((ident.get("mac") or "").upper() == expected_mac.upper()
+                and ident.get("uuid") == uuid and ident.get("sig") == sig.lower()
                 and ident.get("key_id") == key_id):
             return {"ok": True, "ident": ident}
         time.sleep(0.6)
     return {"ok": False, "ident": ident}
 
 
-def write_identity(port: str, uuid: str, sig: str, key_id: str) -> dict:
+def _classify_uncertain_write(port: str, expected_mac: str, uuid: str, sig: str, key_id: str,
+                              detail: str, attempts: int = 3) -> dict:
+    """Resolve a lost response without deleting a possibly-written identity.
+
+    A readable blank/different UUID on the same hardware MAC proves this new
+    identity did not land and the Cloud reservation may be released. An exact
+    match on the same MAC is success. A reused USB path or swapped board is
+    ambiguous regardless of its contents. The
+    same UUID with incomplete/different genuineness fields is a partial write;
+    an unreadable device is ambiguous.  Both must retain the reservation.
+    """
+    last_ident: dict = {}
+    readable = False
+    last_error = ""
+    for _ in range(max(1, attempts)):
+        try:
+            last_ident = read_identity(port)
+            readable = bool(last_ident.get("mac"))
+        except Exception as exc:
+            last_error = str(exc)
+            time.sleep(0.6)
+            continue
+        if ((last_ident.get("mac") or "").upper() == expected_mac.upper()
+                and last_ident.get("uuid") == uuid
+                and last_ident.get("sig") == sig.lower()
+                and last_ident.get("key_id") == key_id):
+            return {
+                "ok": True,
+                "uuid": uuid,
+                "sig": sig,
+                "key_id": key_id,
+                "detail": "write response lost; exact read-back verified",
+                "safe_to_release": False,
+                "ambiguous": False,
+            }
+        time.sleep(0.6)
+
+    actual_uuid = last_ident.get("uuid", "") if readable else ""
+    same_device = readable and (last_ident.get("mac") or "").upper() == expected_mac.upper()
+    if same_device and not actual_uuid:
+        return {
+            "ok": False,
+            "detail": f"{detail}; readable node remains unprovisioned",
+            "safe_to_release": True,
+            "ambiguous": False,
+            "ident": last_ident,
+        }
+    if same_device and actual_uuid != uuid:
+        return {
+            "ok": False,
+            "detail": f"{detail}; node carries a different identity",
+            "safe_to_release": True,
+            "ambiguous": False,
+            "ident": last_ident,
+        }
+    return {
+        "ok": False,
+        "detail": f"{detail}; identity outcome is ambiguous"
+                  + (f" ({last_error})" if last_error else ""),
+        "safe_to_release": False,
+        "ambiguous": True,
+        "ident": last_ident,
+    }
+
+
+def write_identity(port: str, expected_mac: str, uuid: str, sig: str, key_id: str) -> dict:
     """Send 'P <uuid> <sig> <key_id>', then read back 'i' to verify the node
     actually stored what we wrote. Returns {ok, uuid, sig, key_id, detail}.
 
@@ -119,25 +201,35 @@ def write_identity(port: str, uuid: str, sig: str, key_id: str) -> dict:
     '[PROV] identity written' line turned a fully-provisioned node into a false failure,
     the cloud reservation got released, and the unit was stranded (node refuses a
     different UUID forever)."""
-    resp = _txn(port, f"P {uuid} {sig} {key_id}", wait=2.0)
+    try:
+        resp = _txn(port, f"P {uuid} {sig} {key_id}", wait=2.0)
+    except Exception as exc:
+        return _classify_uncertain_write(
+            port, expected_mac, uuid, sig, key_id, f"USB write transport error: {exc}")
     prov_lines = [l.strip() for l in resp.splitlines() if "[PROV]" in l]
     if not any("identity written" in l for l in prov_lines):
         # Refused or no ack — the write may still have landed on an earlier attempt.
-        rb = _read_back_matches(port, uuid, sig, key_id, attempts=2)
-        if rb["ok"]:
+        outcome = _classify_uncertain_write(
+            port, expected_mac, uuid, sig, key_id,
+            "write refused/no acknowledgement", attempts=2)
+        if outcome["ok"]:
             log(f"[NodeSerial] write refused/no-ack on {port} but read-back matches — "
                 f"treating as already-written (idempotent retry)")
-            return {"ok": True, "uuid": uuid, "sig": sig, "key_id": key_id,
-                    "detail": "already written (read-back verified)"}
-        return {"ok": False, "error": "write refused/no-ack",
-                "detail": prov_lines or resp[-200:].strip()}
-    rb = _read_back_matches(port, uuid, sig, key_id)
+        return outcome
+    try:
+        rb = _read_back_matches(port, expected_mac, uuid, sig, key_id)
+    except Exception as exc:
+        return _classify_uncertain_write(
+            port, expected_mac, uuid, sig, key_id,
+            f"acknowledged write but read-back transport failed: {exc}")
     if rb["ok"]:
         return {"ok": True, "uuid": uuid, "sig": sig, "key_id": key_id,
                 "detail": "read-back verified"}
-    ident = rb["ident"]
+    outcome = _classify_uncertain_write(
+        port, expected_mac, uuid, sig, key_id,
+        "read-back mismatch after acknowledged write")
+    ident = outcome.get("ident", {})
     log(f"[NodeSerial] read-back mismatch on {port} after retries: "
         f"wrote uuid={uuid} kid={key_id}, read uuid={ident.get('uuid')} "
-        f"kid={ident.get('key_id')}", "ERROR")
-    return {"ok": False, "uuid": ident.get("uuid"), "sig": ident.get("sig"),
-            "key_id": ident.get("key_id"), "detail": "read-back mismatch (after retries)"}
+        f"kid={ident.get('key_id')} ambiguous={outcome.get('ambiguous')}", "ERROR")
+    return outcome

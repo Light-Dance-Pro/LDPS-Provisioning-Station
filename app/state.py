@@ -1,6 +1,8 @@
 """Centralized application state."""
 import threading
 
+from app.provision_journal import load_hub_pending
+
 
 class AppState:
     def __init__(self):
@@ -24,7 +26,8 @@ class AppState:
         self.wizard_step = "idle"
         self.wizard_mac = ""
         self.wizard_uuid = ""
-        self.hub_pending = None   # signed hub binding awaiting SD write + confirm (flow B)
+        # Public, crash-durable certificate tuple awaiting write/confirm (flow B).
+        self.hub_pending = load_hub_pending()
 
         # Flash
         self.flash_running = False
