@@ -32,10 +32,18 @@ class ProvisionLog:
     def __init__(self, db_path: str = DB_PATH):
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        # Factory history can contain serials and legacy builds may contain a
+        # recovery credential. Keep the local database private even after new
+        # writes stop persisting that secret.
+        try:
+            os.chmod(db_path, 0o600)
+        except OSError:
+            pass
         self._conn.row_factory = sqlite3.Row
         self._conn.execute(_CREATE_SQL)
-        # Idempotent migration: add recovery_key to an existing DB (CREATE IF NOT EXISTS
-        # won't add the column to a table created before recovery keys existed).
+        # Legacy databases may contain a recovery_key column.  Keep the schema
+        # readable for compatibility, but never write or return that secret:
+        # recovery keys are label/re-claim credentials, not production history.
         cols = {r[1] for r in self._conn.execute("PRAGMA table_info(provision_logs)")}
         if "recovery_key" not in cols:
             self._conn.execute("ALTER TABLE provision_logs ADD COLUMN recovery_key TEXT")
@@ -49,20 +57,18 @@ class ProvisionLog:
     def add(self, mac: str, uuid: Optional[str], product_type: str,
             firmware_ver: str, test_results: Optional[dict],
             status: str, error_reason: str = "", batch: str = "",
-            cloud_confirmed: bool = False, recovery_key: str = "",
-            manufacturer_id: str = "") -> int:
+            cloud_confirmed: bool = False, manufacturer_id: str = "") -> int:
         cur = self._conn.execute(
             """INSERT INTO provision_logs
                (timestamp, mac, uuid, product_type, firmware_ver, test_results,
-                status, error_reason, batch, cloud_confirmed, recovery_key, manufacturer_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                status, error_reason, batch, cloud_confirmed, manufacturer_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                datetime.datetime.utcnow().isoformat() + "Z",
+                datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
                 mac, uuid, product_type, firmware_ver,
                 json.dumps(test_results) if test_results else None,
                 status, error_reason, batch,
                 1 if cloud_confirmed else 0,
-                recovery_key or None,
                 manufacturer_id or None,
             )
         )
@@ -116,6 +122,10 @@ class ProvisionLog:
 
     def _row_to_dict(self, row) -> dict:
         d = dict(row)
+        # Do not expose legacy plaintext recovery keys through the History API.
+        # Existing on-disk rows are left untouched pending an explicit owner-
+        # approved cleanup because deleting them is irreversible.
+        d.pop("recovery_key", None)
         if d.get("test_results"):
             try:
                 d["test_results"] = json.loads(d["test_results"])

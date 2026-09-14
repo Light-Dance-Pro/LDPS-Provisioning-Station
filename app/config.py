@@ -7,11 +7,16 @@ TEMPLATE_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "templat
 TEST_PACK_DIR = os.path.join(STATIC_DIR, "test_pack")
 FIRMWARE_DIR = os.path.join(STATIC_DIR, "firmware")
 DB_PATH = os.path.join(STATIC_DIR, "provision_log.db")
+HUB_PROVISION_JOURNAL_PATH = os.environ.get(
+    "HUB_PROVISION_JOURNAL_PATH",
+    os.path.join(STATIC_DIR, "pending_hub_provision.json"),
+)
 
 # Cloud target. LDPS_STAGE selects one of exactly three managed profiles and is
-# required, so the Station never silently provisions against Production. UAT and
-# Production are immutable canonical targets; only Local may override its workstation
-# address. Detail: ../docs/how-to/STAGE_SWITCH.md.
+# required, so the Station never silently provisions against Production. Product
+# identity issuance is available only in Local development or the Production factory
+# authority; UAT is for application/integration QA and accepts canonical public
+# certificates through stage enrollment instead of minting another identity.
 # Station uses manufacturer-key auth only, so no Supabase config here (unlike the Hub).
 STAGE_CLOUD_URLS = {
     "local": "http://localhost:3737",
@@ -36,6 +41,7 @@ DEFAULT_CLOUD_URL = (
 ) or STAGE_CLOUD_URLS[_STAGE]
 DEFAULT_CLOUD_URL = DEFAULT_CLOUD_URL.rstrip("/")
 LDPS_STAGE_RESOLVED = _STAGE
+IDENTITY_MINTING_ALLOWED = _STAGE in {"local", "prod"}
 
 # §6.1 hub provisioning channel — where the Station reaches the assembled OPi to read its
 # cpuid + write the cloud-signed binding (flow B step-3). Factory transport = USB-gadget/eth

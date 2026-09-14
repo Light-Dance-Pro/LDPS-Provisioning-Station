@@ -19,8 +19,9 @@ repository.
 | Control Hub | Read hardware identity, register it, write the signed SD binding, restart and perform functional QC | Direct-local provisioning channel |
 | Console Hub Dongle | Ask the assembled Control Hub to flash its RF-bridge firmware | Control Hub local channel |
 
-The factory Test Board and the Console Hub's RF bridge are described as dongles in parts of the
-code. Neither is the temporary Desktop Hub Dongle role of an LED Node.
+An LED Node may temporarily perform the Desktop controller runtime role after a live Desktop Hub
+claim. That role is not a separately provisioned product identity and has no dedicated Station
+provisioning path. The factory Test Board and the Console Hub's RF bridge are separate devices.
 
 ## Development
 

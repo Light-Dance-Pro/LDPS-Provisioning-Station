@@ -181,6 +181,9 @@
     <div v-if="!cloudReachable" class="offline-banner">
       ⚠ Cloud disconnected — connect to a network. Registration / writes are paused (all registration needs the Cloud).
     </div>
+    <div v-if="cloudStage === 'uat'" class="offline-banner" style="border-color:rgba(251,146,60,.55);color:#fdba74;">
+      UAT tests application flows but does not create product identities. Provision new products once through the Production factory authority; UAT enrolls that same public certificate automatically.
+    </div>
 
 
     <!-- ═══ Dashboard Tab ═══ -->
@@ -417,10 +420,12 @@
                · Mark hub defective — final verdict on the UNIT: keeps row + quota for yield/RMA. -->
           <div v-if="hubFlowState === 'failed'" style="margin-top:16px;border:1px solid var(--error);border-radius:8px;background:rgba(239,68,68,0.07);padding:14px;">
             <div class="text-error" style="margin-bottom:10px;">&#x26A0; [[ hubFlowFailMsg ]]</div>
-            <button class="btn btn-primary" @click="retryHubFlow">&#x21BB; Retry this step</button>
+            <button class="btn btn-primary" :disabled="hubPendingWrongStage" @click="retryHubFlow"
+                    :title="hubPendingWrongStage ? 'Switch the Station back to the transaction environment first' : ''">&#x21BB; Retry this step</button>
             <button v-if="hubResult && hubResult.hub_uuid" class="btn btn-outline" style="margin-left:8px;" @click="hubReleaseFlow"
+                    :disabled="hubPendingWrongStage"
                     title="Free the quota slot + delete the reservation (setup mistake, not a bad unit)">Release &amp; start over</button>
-            <button class="btn btn-outline" style="margin-left:8px;" @click="hubFailUnit">Mark hub defective</button>
+            <button class="btn btn-outline" style="margin-left:8px;" :disabled="hubPendingWrongStage" @click="hubFailUnit">Mark hub defective</button>
           </div>
 
           <!-- DONE + sticker -->
@@ -506,6 +511,8 @@ Vue.createApp({
       cloudConnected: false,
       cloudReachable: true,   // cloud network reachable (probe)
       cloudUrl: '',           // resolved cloud target (for the gate display)
+      cloudStage: '',
+      identityMintingAllowed: false,
       hasSavedSession: false, // a persisted mfr key exists (login-once)
       showKeyEntry: false,    // gate: force the key field even when a session is saved
       gateBusy: false,
@@ -551,6 +558,7 @@ Vue.createApp({
       hubFlowState: 'idle',      // idle | running | failed | done
       hubFlowProgress: 0,
       hubFlowFailMsg: '',
+      hubPendingWrongStage: false,
       hubFlowPhaseIdx: 0,
       hubReady: { hub: false, hubBlocked: false, hubState: '', cloud: false, checking: false },
       hubFlowProvision: null,    // {hub_uuid, qr, verifyUrl}
@@ -585,8 +593,8 @@ Vue.createApp({
       return { label: '', color: '', bg: '' };
     },
     nodeQuotas() { return (this.quotas || []).filter(q => q.provision_flow === 'node'); },
-    nodeAllReady() { return this.nodeReady.dongle && this.nodeReady.node && this.nodeReady.cloud; },
-    hubAllReady() { return this.hubReady.hub && this.hubReady.cloud; },
+    nodeAllReady() { return this.identityMintingAllowed && this.nodeReady.dongle && this.nodeReady.node && this.nodeReady.cloud; },
+    hubAllReady() { return this.identityMintingAllowed && this.hubReady.hub && this.hubReady.cloud; },
     hubQuotas() { return (this.quotas || []).filter(q => q.provision_flow === 'hub'); },
   },
 
@@ -610,6 +618,7 @@ Vue.createApp({
     this.initWebSocket();
     this.loadDbStats();
     axios.get('/api/hub/host').then(r => { this.hubHost = r.data.hub_host || ''; }).catch(() => {});
+    this.loadHubPending();
     // Login gate: pick up an auto-restored session + keep cloud/network state fresh.
     this.refreshCloudStatus();
     setInterval(() => this.refreshCloudStatus(), 4000);
@@ -769,8 +778,38 @@ Vue.createApp({
         }
       } finally { this._hubReadyBusy = false; this.hubReady.checking = false; }
     },
+    async loadHubPending() {
+      try {
+        const r = await axios.get('/api/hub/pending');
+        const pending = r.data && r.data.pending;
+        if (!pending || !pending.hub_uuid || this.hubFlowState === 'running') return;
+        this.hubResult = pending;
+        this.hubCpuid = pending.cpuid || '';
+        this.hubProductType = pending.product || this.hubProductType;
+        const resumeKey = pending.phase === 'written' ? 'verify' : 'write';
+        const resumeIdx = this.hubFlow.findIndex(p => p.key === resumeKey);
+        this.hubFlowPhaseIdx = resumeIdx < 0 ? 4 : resumeIdx;
+        this.hubFlow.forEach((p, idx) => {
+          p.status = idx < this.hubFlowPhaseIdx ? 'done' : (idx === this.hubFlowPhaseIdx ? 'fail' : 'pending');
+          p.detail = idx === this.hubFlowPhaseIdx ? 'Safe resume point' : '';
+        });
+        this.hubFlowProgress = Math.round(this.hubFlowPhaseIdx / this.hubFlow.length * 100);
+        const wrongStage = pending.authority_stage && r.data.current_stage
+          && pending.authority_stage !== r.data.current_stage;
+        this.hubPendingWrongStage = !!wrongStage;
+        this.hubFlowFailMsg = wrongStage
+          ? ('This unfinished Hub transaction belongs to ' + pending.authority_stage.toUpperCase()
+             + '. Switch the Station back to that environment before resuming it.')
+          : (pending.phase === 'written'
+            ? 'Recovered the same written Hub identity. Retry will re-check this Hub, run final QC and finish the Cloud commit.'
+            : 'Recovered the same signed Hub identity. Retry will write this exact certificate; it will not mint a new identity.');
+        this.hubFlowState = 'failed';
+        this._stopHubReadyPoll();
+      } catch (e) { /* no recoverable Hub transaction */ }
+    },
     _startHubReadyPoll() {
       this._stopHubReadyPoll();
+      if (this.hubFlowState !== 'idle') return;
       this.checkHubReady(true);
       this._hubReadyTimer = setInterval(() => {
         if (this.tab === 'hub' && this.hubFlowState === 'idle') this.checkHubReady(false);
@@ -780,14 +819,15 @@ Vue.createApp({
     _stopHubReadyPoll() { if (this._hubReadyTimer) { clearInterval(this._hubReadyTimer); this._hubReadyTimer = null; } },
     nextHub() {
       this.hubFlowState = 'idle';
+      this.hubPendingWrongStage = false;
       this.hubFlow.forEach(p => { p.status = 'pending'; p.detail = ''; });
-      this.hubFlowProvision = null; this.hubResult = null; this._hubWroteIdentity = false;
+      this.hubFlowProvision = null; this.hubResult = null;
       this._startHubReadyPoll();
     },
     startHubFlow() {
       this._stopHubReadyPoll();
       this.hubFlow.forEach(p => { p.status = 'pending'; p.detail = ''; });
-      this.hubFlowProvision = null; this.hubResult = null; this._hubWroteIdentity = false;
+      this.hubFlowProvision = null; this.hubResult = null;
       this.hubCpuid = this.hubReady.cpuid || this.hubCpuid;
       this.hubProductType = this._hubProductKey();
       this.hubFlowFailMsg = ''; this.hubFlowProgress = 0;
@@ -824,8 +864,9 @@ Vue.createApp({
         }
       }
       this.hubFlowState = 'idle';
+      this.hubPendingWrongStage = false;
       this.hubFlow.forEach(p => { p.status = 'pending'; p.detail = ''; });
-      this.hubResult = null; this._hubWroteIdentity = false;
+      this.hubResult = null;
       this._startHubReadyPoll();
     },
     async hubReleaseFlow() {
@@ -847,8 +888,9 @@ Vue.createApp({
         }
       }
       this.hubFlowState = 'idle';
+      this.hubPendingWrongStage = false;
       this.hubFlow.forEach(p => { p.status = 'pending'; p.detail = ''; });
-      this.hubResult = null; this._hubWroteIdentity = false;
+      this.hubResult = null;
       this._startHubReadyPoll();
     },
     _runHubPhase(key) {
@@ -917,7 +959,7 @@ Vue.createApp({
         ['ok', 'failed'], 180000);
       if (st === null) throw new Error('Dongle flash outcome unknown after 3min — check /tmp/dongle_flash.log on the hub.');
       if (st === 'failed') throw new Error('Dongle flash FAILED (esptool rc≠0) — see /tmp/dongle_flash.log on the hub. Check the dongle is seated on ' + 'its USB.');
-      this._setHubPhase('dongle', 'done', (r.data && r.data.version) ? ('RF Bridge v' + r.data.version + ' · flashed') : 'flashed');
+      this._setHubPhase('dongle', 'done', (r.data && r.data.version) ? ('Console Hub Dongle v' + r.data.version + ' · flashed') : 'flashed');
     },
     async _hubPhaseSign() {
       const product = this._hubProductKey();
@@ -929,9 +971,9 @@ Vue.createApp({
       this._setHubPhase('sign', 'done', r.data.hub_uuid);
     },
     async _hubPhaseWrite() {
-      // Step 1: write the signed binding to the hub over §6.1. RE-ENTRANT: if a previous
-      // attempt already wrote it, the hub's channel is closed (404 "already provisioned")
-      // — treat that as written and go finish the commit instead of failing.
+      // Write the signed binding to the hub over §6.1. The Station backend
+      // recovers a lost response only when public boot-status verifies this
+      // exact hub_uuid; a closed/invalid channel is never assumed successful.
       this._setHubPhase('write', 'running', 'Writing identity (§6.1)…');
       try {
         const r = await axios.post('/api/hub/write-identity', {
@@ -940,31 +982,10 @@ Vue.createApp({
           signing_keys: this.hubResult.signing_keys,
         });
         if (!r.data || !r.data.ok || !r.data.provisioned) throw new Error('Write not confirmed: ' + ((r.data && r.data.error) || 'no ack'));
-        this._hubWroteIdentity = true;
       } catch (e) {
         const d = (e.response && e.response.data) || {};
-        // Channel closed (hub 404) AFTER our own write in this run = the earlier write
-        // landed and the hub provisioned itself — proceed to the commit, don't fail.
-        const closedAfterOurWrite = d.hub_status === 404 && this._hubWroteIdentity;
-        if (!closedAfterOurWrite) {
-          if (e instanceof Error && !e.response) throw e;
-          throw new Error('Write failed: ' + (d.error || e.message));
-        }
-      }
-      // Step 2: commit to Cloud — success is GATED on this (a silently-lost commit left
-      // a shipped hub the cloud didn't know about; reaped later = zombie identity).
-      this._setHubPhase('write', 'running', 'Identity written — committing to Cloud…');
-      let c;
-      try {
-        c = (await axios.post('/api/hub/confirm', { hub_uuid: this.hubResult.hub_uuid, success: true })).data;
-      } catch (e) {
-        c = { ok: false, retryable: true, error: (e.response?.data?.error || e.message) };
-      }
-      if (!c.ok) {
-        const hint = c.retryable
-          ? 'Retry resumes the commit (the identity is NOT re-written).'
-          : 'The reservation is gone (expired) — the hub must be RMA-cleared and re-provisioned.';
-        throw new Error('Identity written to the hub, but the Cloud commit failed: ' + (c.error || ('HTTP ' + c.status)) + '. ' + hint);
+        if (e instanceof Error && !e.response) throw e;
+        throw new Error('Write failed: ' + (d.error || e.message));
       }
       this._setHubPhase('write', 'done', this.hubResult.hub_uuid);
     },
@@ -989,14 +1010,34 @@ Vue.createApp({
         try {
           const r = await axios.get('/api/hub/status', { timeout: 4000 });
           boot = r.data && r.data.boot; health = r.data && r.data.health;
-          if (boot && boot.boot_verified && !boot.locked && health && health.ok) break;
+          if (boot && boot.boot_verified && !boot.locked
+              && boot.hub_uuid === this.hubResult.hub_uuid
+              && health && health.ok) break;
         } catch (e) { /* still restarting */ }
       }
-      if (!boot || !boot.boot_verified || boot.locked) {
-        throw new Error('Hub did not come back VERIFIED after the restart (boot: ' + JSON.stringify(boot) + ') — its identity may not have persisted.');
+      if (!boot || !boot.boot_verified || boot.locked || boot.hub_uuid !== this.hubResult.hub_uuid) {
+        throw new Error('Hub did not come back with the expected VERIFIED identity after the restart (boot: ' + JSON.stringify(boot) + ') — do not commit or ship it.');
       }
       if (!health || !health.ok) {
         throw new Error('Hub booted but is NOT operational (healthz: ' + JSON.stringify(health || {}) + ') — main loop or dongle down. Do not ship this unit as-is.');
+      }
+
+      // Final Cloud commit happens only after the exact identity, main loop and
+      // dongle have passed post-restart QC. A retry repeats the proof and then
+      // uses the idempotent commit; it never re-mints or blindly releases.
+      this._setHubPhase('verify', 'running', 'QC passed — committing to Cloud…');
+      let c;
+      try {
+        c = (await axios.post('/api/hub/confirm', { hub_uuid: this.hubResult.hub_uuid, success: true })).data;
+      } catch (e) {
+        c = { ok: false, retryable: true, error: (e.response?.data?.error || e.message) };
+      }
+      if (!c.ok) {
+        const hint = c.retryable
+          ? 'Retry re-checks this same Hub and resumes the commit.'
+          : 'Keep this Hub out of production for audited recovery; do not clear or re-mint it.';
+        throw new Error('Hub QC passed, but the Cloud commit failed: ' +
+          (c.error || ('HTTP ' + c.status)) + '. ' + hint);
       }
       this.hubFlowProvision = { hub_uuid: this.hubResult.hub_uuid, production_date: new Date().toISOString().slice(0, 10) };
       this._makeHubStickerQR();
@@ -1265,6 +1306,8 @@ Vue.createApp({
         this.cloudConnected = r.data.connected;
         this.cloudReachable = r.data.reachable;
         this.cloudUrl = r.data.cloud_url || '';
+        this.cloudStage = r.data.stage || '';
+        this.identityMintingAllowed = !!r.data.identity_minting_allowed;
         this.hasSavedSession = r.data.has_saved_session;
         if (r.data.connected) this.cloudEmail = r.data.name || 'Manufacturer';
         // Login-once: a saved session but not yet connected + network is back → auto-reconnect.

@@ -18,7 +18,7 @@ direct-local device access and factory QC.
 | Station implementation and operator behavior | This repository |
 
 The code also calls the factory RF Test Board a dongle. That fixture and the Console Hub RF bridge
-must not be confused with the temporary Desktop Hub Dongle runtime role of an LED Node.
+must not be confused with an LED Node temporarily serving the Desktop controller runtime role.
 
 ## LED Node flow
 

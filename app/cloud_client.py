@@ -55,15 +55,44 @@ class CloudClient:
         result = await self.login(self.api_key)
         return result.get("quotas", self.quotas)
 
+    async def resolve_factory_firmware(self, device: str) -> dict:
+        """Resolve an allowlisted dongle factory image through release authority."""
+        if device != "console-dongle":
+            return {"ok": False, "error": "unknown factory firmware device"}
+        if not self.api_key:
+            return {"ok": False, "error": "manufacturer login required", "status": 401}
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                response = await client.get(
+                    f"{self.cloud_url}/provision/firmware/{device}",
+                    headers=self._headers(),
+                )
+            try:
+                payload = response.json()
+            except Exception:
+                payload = {}
+            if response.status_code == 200 and payload.get("ok") is True:
+                return payload
+            return {
+                "ok": False,
+                "status": response.status_code,
+                "reason": payload.get("reason"),
+                "error": payload.get("error") or payload.get("reason")
+                         or f"HTTP {response.status_code}",
+            }
+        except Exception as exc:
+            return {"ok": False, "status": 0, "error": str(exc)}
+
     async def request_uuid(self, hardware_serial: str, product: str,
                            test_results: dict = None, firmware_ver: str = "") -> dict | None:
         """Mint a node UUID. product (the catalog product key) is REQUIRED (cloud QC gate). Returns
         {uuid, signature, key_id, recovery_key} — signature is the cloud's Ed25519
         genuineness sig over the UUID, written to the node over USB and verified by
-        Hubs; recovery_key is the per-node re-claim key (returned ONCE, plaintext) the
-        operator prints on the box (§3.4) — never written to the node, stored encrypted
-        in the cloud. Returns None on failure (signature/key_id may be None if cloud
-        signing is not configured; the UUID is still minted)."""
+        Hubs; recovery_key is the per-node re-claim key (plaintext only in the active
+        factory response; idempotent retries return the same key) that the operator
+        prints on the box (§3.4) — never written to the node and stored encrypted in
+        Cloud. Returns None on failure. Genuineness signing is mandatory: the
+        Cloud must not reserve a production identity without signature + key_id."""
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 r = await client.post(f"{self.cloud_url}/provision/request-uuid",
@@ -89,7 +118,7 @@ class CloudClient:
     async def confirm(self, uuid: str, success: bool = True) -> dict:
         """COMMIT (identity written) or RELEASE (write failed → free quota).
         Returns {ok, status, error} — status 0 = network error (retryable);
-        4xx = terminal (e.g. 404 reservation reaped/unknown, 409 wrong lifecycle)."""
+        4xx = terminal (e.g. 404 missing record, 409 wrong lifecycle)."""
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 r = await client.post(f"{self.cloud_url}/provision/confirm",
@@ -171,7 +200,7 @@ class CloudClient:
     async def confirm_hub(self, hub_uuid: str, success: bool = True) -> dict:
         """COMMIT (SD binding written) or RELEASE (write failed → frees the quota).
         Returns {ok, status, error} — status 0 = network error (retryable);
-        4xx = terminal (404 reservation reaped/unknown, 409 wrong lifecycle)."""
+        4xx = terminal (404 missing record, 409 wrong lifecycle)."""
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 r = await client.post(f"{self.cloud_url}/provision/hub/confirm",
@@ -186,6 +215,17 @@ class CloudClient:
             return {"ok": r.status_code == 200, "status": r.status_code, "error": err}
         except Exception as e:
             return {"ok": False, "status": 0, "error": str(e)}
+
+    async def get_signing_keys(self) -> list:
+        """Fetch public factory keys; these are safe to cache and use offline."""
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.get(f"{self.cloud_url}/provision/signing-keys")
+            if r.status_code != 200:
+                return []
+            return (r.json() or {}).get("keys", [])
+        except Exception:
+            return []
 
     async def defect_hub(self, hub_uuid: str, reason: str = "") -> bool:
         """Mark a reserved/provisioned hub 'defected' (keeps row + quota for yield tracking)."""

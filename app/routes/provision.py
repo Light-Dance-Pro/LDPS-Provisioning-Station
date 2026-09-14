@@ -10,6 +10,7 @@ from threading import Event
 from fastapi import APIRouter, Request, Body
 from fastapi.responses import JSONResponse
 
+from app.config import IDENTITY_MINTING_ALLOWED
 from app.utils import log
 
 router = APIRouter()
@@ -130,7 +131,7 @@ _RETRYABLE_HTTP = (0, 500, 502, 503, 504)   # 0 = network error
 
 async def _confirm_commit(s, uuid: str, attempts: int = 3) -> dict:
     """Commit (reserved → provisioned) with bounded retries on transient failures.
-    Terminal 4xx (404 reservation reaped/unknown, 409 wrong lifecycle) returns
+    Terminal 4xx (404 missing record, 409 wrong lifecycle) returns
     immediately — retrying those can never succeed."""
     last = {"ok": False, "status": 0, "error": "not attempted"}
     for attempt in range(max(1, attempts)):
@@ -149,7 +150,7 @@ def _log_success(s, mac: str, uuid: str, product: str, firmware_ver: str,
     s.provision_log.add(
         mac=mac, uuid=uuid, product_type=product,
         firmware_ver=firmware_ver or "?", test_results=test_results,
-        status="success", cloud_confirmed=True, recovery_key=recovery_key,
+        status="success", cloud_confirmed=True,
         manufacturer_id=getattr(getattr(s, "cloud_client", None), "manufacturer_id", ""),
     )
     s.stats_provisioned += 1
@@ -172,9 +173,19 @@ async def finalize(request: Request, mac: str, data: dict = Body(...)):
     already written (a previous attempt whose commit failed), a retry RESUMES the commit
     for the node's own UUID instead of minting a new one — so 'Retry' after any network
     blip converges to done, and the unit is never left half-committed silently."""
-    from app.node_serial import write_identity, read_identity
+    from app.node_serial import (
+        write_identity,
+        read_identity,
+        verify_node_identity_signature,
+    )
 
     s = _s(request)
+    if not IDENTITY_MINTING_ALLOWED:
+        return JSONResponse({
+            "error": "UAT is for application QA and stage enrollment; it cannot mint or commit "
+                     "product identity. Switch the Provisioning Station to Production factory mode.",
+            "code": "IDENTITY_AUTHORITY_DISABLED",
+        }, 403)
     if not getattr(s, "cloud_client", None):
         return JSONResponse({"error": "Not logged in to Cloud"}, 401)
 
@@ -212,56 +223,123 @@ async def finalize(request: Request, mac: str, data: dict = Body(...)):
         # adopt it — the operator must Clear first.
         uuid = ident["uuid"]
         if data.get("resume_uuid") == uuid:
-            c = await _confirm_commit(s, uuid)
-            if c["ok"]:
-                _log_success(s, mac, uuid, product, firmware_ver, test_results, prior_recovery_key)
-                log(f"[Provision] RESUMED commit (USB): {mac} → {uuid}")
-                return {"ok": True, "mac": mac, "uuid": uuid, "key_id": ident.get("key_id"),
-                        "recovery_key": prior_recovery_key, "cloud_confirmed": True,
-                        "resumed": True}
-            if c["status"] in _RETRYABLE_HTTP:
-                return JSONResponse({"error": f"Node is written (UUID {uuid}) but the cloud commit "
-                                              f"is unreachable ({c['error']}). Retry when the network is back "
-                                              f"— Retry resumes this unit, it does not re-mint.",
-                                     "code": "CONFIRM_RETRYABLE", "uuid": uuid,
-                                     "recovery_key": prior_recovery_key}, 502)
-            return JSONResponse({"error": f"The cloud refuses the commit for {uuid} "
-                                          f"({c['error'] or 'no record'} — reservation likely expired). "
-                                          f"Clear the node identity and start over.",
-                                 "code": "ALREADY_PROVISIONED"}, 409)
-        return JSONResponse({"error": f"Node already provisioned (UUID {uuid}). "
-                                      f"Clear its identity (Re-provision) before writing a new one.",
-                             "code": "ALREADY_PROVISIONED"}, 409)
+            signing_keys = await s.cloud_client.get_signing_keys()
+            identity_complete = bool(ident.get("sig") and ident.get("key_id"))
+            identity_verified = identity_complete and verify_node_identity_signature(
+                uuid, ident.get("sig", ""), ident.get("key_id", ""), signing_keys)
+            if identity_verified:
+                c = await _confirm_commit(s, uuid)
+                if c["ok"]:
+                    _log_success(s, mac, uuid, product, firmware_ver, test_results, prior_recovery_key)
+                    log(f"[Provision] RESUMED commit (USB): {mac} → {uuid}")
+                    return {"ok": True, "mac": mac, "uuid": uuid, "key_id": ident.get("key_id"),
+                            "recovery_key": prior_recovery_key, "cloud_confirmed": True,
+                            "resumed": True}
+                if c["status"] in _RETRYABLE_HTTP:
+                    return JSONResponse({"error": f"Node is written (UUID {uuid}) but the cloud commit "
+                                                  f"is unreachable ({c['error']}). Retry when the network is back "
+                                                  f"— Retry resumes this unit, it does not re-mint.",
+                                         "code": "CONFIRM_RETRYABLE", "uuid": uuid,
+                                         "recovery_key": prior_recovery_key}, 502)
+                return JSONResponse({"error": f"The cloud refuses the commit for {uuid} "
+                                              f"({c['error'] or 'no record'} — missing or invalid lifecycle). "
+                                              f"Do not provision another unit with this record; set this unit aside "
+                                              f"for an audited RMA clear.",
+                                     "code": "CONFIRM_TERMINAL", "uuid": uuid,
+                                     "recovery_key": prior_recovery_key}, 409)
 
-    # Step 1: mint UUID + genuineness signature from Cloud.
-    minted = await s.cloud_client.request_uuid(hw_serial, product, test_results, firmware_ver)
-    if not minted or not minted.get("uuid"):
-        return JSONResponse({"error": "Failed to get UUID from Cloud"}, 502)
-    uuid = minted["uuid"]
-    sig = minted.get("signature")
-    key_id = minted.get("key_id")
-    # recovery_key: returned ONCE by the cloud (plaintext), never written to the node — the
-    # operator prints it on the box for re-claim (§3.4). Surfaced to the UI + recorded locally.
-    recovery_key = minted.get("recovery_key") or ""
-    if not sig or not key_id:
-        # Genuineness is mandatory — a node with no signature can't be Hub-verified.
-        await s.cloud_client.confirm(uuid, success=False)
-        return JSONResponse({"error": "Cloud returned no signature (signing not configured)"}, 502)
+            # A power loss can leave UUID written before the genuineness fields.
+            # Re-request the same reservation and finish the idempotent P write;
+            # never commit a UUID merely because it matches the UI's memory.
+            minted = await s.cloud_client.request_uuid(
+                hw_serial, product, test_results, firmware_ver)
+            if not minted or minted.get("uuid") != uuid:
+                return JSONResponse({
+                    "error": "Node has a partial identity, but Cloud no longer returns the same reservation. "
+                             "Keep the unit out of production and use the audited RMA recovery path.",
+                    "code": "PARTIAL_IDENTITY_ORPHANED",
+                    "uuid": uuid,
+                    "recovery_key": prior_recovery_key,
+                }, 409)
+            sig = minted.get("signature") or ""
+            key_id = minted.get("key_id") or ""
+            recovery_key = minted.get("recovery_key") or prior_recovery_key
+            if ((ident.get("sig") and ident.get("sig") != sig.lower())
+                    or (ident.get("key_id") and ident.get("key_id") != key_id)):
+                return JSONResponse({
+                    "error": "Node carries partial genuineness data that does not match the Cloud reservation. "
+                             "Do not commit it; use the audited RMA recovery path.",
+                    "code": "PARTIAL_IDENTITY_CONFLICT",
+                    "uuid": uuid,
+                    "recovery_key": recovery_key,
+                }, 409)
+            if not sig or not key_id or not verify_node_identity_signature(
+                    uuid, sig, key_id, signing_keys):
+                return JSONResponse({
+                    "error": "Cloud identity signature could not be verified; nothing was committed.",
+                    "code": "SIGNATURE_UNVERIFIED",
+                    "uuid": uuid,
+                    "recovery_key": recovery_key,
+                }, 502)
+            # Continue into the common write/read-back/commit path below.
+        else:
+            return JSONResponse({"error": f"Node already provisioned (UUID {uuid}). "
+                                          f"Clear its identity (Re-provision) before writing a new one.",
+                                 "code": "ALREADY_PROVISIONED"}, 409)
+    else:
+        # Step 1: mint UUID + genuineness signature from Cloud.
+        minted = await s.cloud_client.request_uuid(hw_serial, product, test_results, firmware_ver)
+        if not minted or not minted.get("uuid"):
+            return JSONResponse({"error": "Failed to get UUID from Cloud"}, 502)
+        uuid = minted["uuid"]
+        sig = minted.get("signature") or ""
+        key_id = minted.get("key_id") or ""
+        # recovery_key: returned ONCE by the cloud (plaintext), never written to the node — the
+        # operator prints it on the box for re-claim (§3.4). It is surfaced only to
+        # the active UI flow; production history must not become a second plaintext
+        # recovery-credential store.
+        recovery_key = minted.get("recovery_key") or ""
+        signing_keys = await s.cloud_client.get_signing_keys()
+        if not sig or not key_id or not verify_node_identity_signature(
+                uuid, sig, key_id, signing_keys):
+            # Nothing has been written to hardware, so this release is deterministic.
+            await s.cloud_client.confirm(uuid, success=False)
+            return JSONResponse({
+                "error": "Cloud identity signature could not be verified; reservation released.",
+                "code": "SIGNATURE_UNVERIFIED",
+            }, 502)
 
     # Step 2: write identity to the node over USB + read-back verify (blocking → thread).
     if s.ws:
         s.ws.broadcast("provision", {"step": "writing", "mac": mac, "uuid": uuid})
     try:
-        w = await asyncio.to_thread(write_identity, port, uuid, sig, key_id)
+        w = await asyncio.to_thread(write_identity, port, hw_serial, uuid, sig, key_id)
     except Exception as e:
-        await s.cloud_client.confirm(uuid, success=False)   # release the reservation
-        return JSONResponse({"error": f"USB write error on {port}: {e}"}, 500)
+        # The P command may have reached NVS before the USB exception.  Releasing
+        # here can orphan a write-once physical identity, so retain the reservation.
+        return JSONResponse({
+            "error": f"USB write outcome is ambiguous on {port}: {e}. Reconnect the same unit and Retry.",
+            "code": "WRITE_AMBIGUOUS",
+            "uuid": uuid,
+            "recovery_key": recovery_key,
+        }, 502)
     if not w.get("ok"):
-        rel = await s.cloud_client.confirm(uuid, success=False)
-        if not rel["ok"]:
-            log(f"[Provision] release failed for {uuid} after write failure "
-                f"({rel['error']}) — reservation will be reaped server-side", "WARNING")
-        return JSONResponse({"error": f"Node identity write failed: {w.get('detail')}"}, 500)
+        if w.get("safe_to_release"):
+            rel = await s.cloud_client.confirm(uuid, success=False)
+            if not rel["ok"]:
+                log(f"[Provision] release failed for {uuid} after proven no-write "
+                    f"({rel['error']})", "WARNING")
+            return JSONResponse({
+                "error": f"Node identity write failed before landing: {w.get('detail')}",
+                "code": "WRITE_NOT_APPLIED",
+            }, 500)
+        return JSONResponse({
+            "error": f"Node identity write outcome is ambiguous: {w.get('detail')}. "
+                     "The reservation was retained; reconnect this same unit and Retry.",
+            "code": "WRITE_AMBIGUOUS",
+            "uuid": uuid,
+            "recovery_key": recovery_key,
+        }, 502)
 
     # Step 3: confirm with Cloud (reserved → provisioned) — success is gated on this.
     c = await _confirm_commit(s, uuid)
@@ -270,7 +348,8 @@ async def finalize(request: Request, mac: str, data: dict = Body(...)):
             f"(status={c['status']} {c['error']})", "ERROR")
         code = "CONFIRM_RETRYABLE" if c["status"] in _RETRYABLE_HTTP else "CONFIRM_TERMINAL"
         hint = ("Retry resumes this unit (no re-mint)." if code == "CONFIRM_RETRYABLE"
-                else "The reservation is gone (expired/reaped) — Clear the node identity and start over.")
+                else "The identity record is missing or in an invalid lifecycle. Keep the unit out of production "
+                     "and use the audited RMA clear path; do not re-mint another unit from this record.")
         return JSONResponse({"error": f"Identity written to the node, but the cloud commit failed: "
                                       f"{c['error'] or ('HTTP ' + str(c['status']))}. {hint}",
                              "code": code, "uuid": uuid, "recovery_key": recovery_key}, 502)
