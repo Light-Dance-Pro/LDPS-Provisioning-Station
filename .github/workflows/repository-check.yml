@@ -1,0 +1,22 @@
+name: repository-check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  repository-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Run repository-contract fixtures
+        run: python3 -m unittest tests.test_docs_lint tests.test_repo_lint
+      - name: Validate repository documentation
+        run: python3 tools/docs_lint.py
+      - name: Validate portable repository safety
+        run: python3 tools/repo_lint.py
